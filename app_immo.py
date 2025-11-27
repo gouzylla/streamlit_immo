@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
-from supabase import create_client, Client, APIError # Importe APIError spécifiquement
+# CORRECTION ICI: On importe create_client et les types depuis supabase.client,
+# car l'importation directe ne fonctionne pas toujours.
+from supabase.client import create_client, Client, APIError 
 import plotly.express as px
 
 # --- 1. CONFIGURATION DE LA PAGE ---
