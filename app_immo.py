@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from supabase import create_client, Client
+from supabase import create_client, Client, APIError # Importe APIError spécifiquement
 import plotly.express as px
 
 # --- 1. CONFIGURATION DE LA PAGE ---
@@ -16,23 +16,25 @@ st.set_page_config(
 def init_connection():
     """
     Initialise la connexion à Supabase.
-    Tente de récupérer les clés dans st.secrets (Prod) ou utilise des valeurs par défaut (Dev).
+    Récupère les clés depuis st.secrets (requis par Streamlit Cloud).
     """
-    try:
-        # Cas 1 : Production (Streamlit Cloud) ou fichier .streamlit/secrets.toml local
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
-    except (FileNotFoundError, KeyError):
-        # Cas 2 : Fallback (Développement local rapide sans fichier secrets)
-        # ATTENTION : Remplacez ces valeurs par vos clés UNIQUEMENT en local.
-        # Ne committez jamais ce fichier avec les vraies clés sur GitHub public.
-        url = "REMPLACER_PAR_VOTRE_URL_SUPABASE"
-        key = "REMPLACER_PAR_VOTRE_KEY_SUPABASE"
+    
+    url = st.secrets.get("SUPABASE_URL", "REMPLACER_PAR_VOTRE_URL_SUPABASE")
+    key = st.secrets.get("SUPABASE_KEY", "REMPLACER_PAR_VOTRE_KEY_SUPABASE")
+    
+    # Vérification des clés de fallback
+    if url == "REMPLACER_PAR_VOTRE_URL_SUPABASE" or key == "REMPLACER_PAR_VOTRE_KEY_SUPABASE":
+        # Affiche un message d'erreur clair si les secrets ne sont pas configurés
+        st.error(
+            "❌ Erreur de configuration: Les variables SUPABASE_URL ou SUPABASE_KEY sont manquantes ou incorrectes."
+            "\n\nVérifiez que vous avez copié le contenu du fichier secrets.toml dans les Secrets de Streamlit Cloud."
+        )
+        return None
         
     try:
         return create_client(url, key)
     except Exception as e:
-        st.error(f"❌ Erreur critique : Impossible de se connecter à Supabase. \n{e}")
+        st.error(f"❌ Erreur critique : Impossible de se connecter à Supabase. Vérifiez l'URL et la clé. \n Détail: {e}")
         return None
 
 supabase = init_connection()
@@ -41,11 +43,24 @@ supabase = init_connection()
 
 @st.cache_data(ttl=3600)  # Cache d'1 heure pour la liste des villes (ça ne change pas souvent)
 def get_villes_list():
-    """Récupère le référentiel des villes (Nom + CP + INSEE)"""
+    """Récupère le référentiel des villes (Nom + CP + INSEE) depuis la table Dim_ville"""
     if not supabase: return pd.DataFrame()
     
-    # On ne récupère que les colonnes nécessaires pour le menu pour être léger
-    response = supabase.table('villes').select('code_insee, code_postal, nom_commune').execute()
+    TABLE_DIM_VILLE = 'Dim_ville' # Nom de la table des villes
+    
+    try:
+        # On ne récupère que les colonnes nécessaires pour le menu pour être léger
+        response = supabase.table(TABLE_DIM_VILLE).select('code_insee, code_postal, nom_commune').execute()
+    except APIError as e:
+        # Gère spécifiquement les erreurs de RLS ou de nom de table/colonne
+        st.error(
+            f"❌ Erreur Supabase (APIError) : La requête SELECT sur la table '{TABLE_DIM_VILLE}' a échoué."
+            "\n\nCauses possibles :"
+            "\n1. **Permissions (RLS)** : La clé 'anon' n'a pas les droits de lecture. (Vérifiez la politique SELECT pour le rôle 'anon' sur cette table.)"
+            "\n2. **Nom de Colonne** : Vérifiez l'orthographe exacte des colonnes ('code_insee', 'code_postal', 'nom_commune')."
+            f"\nDétail technique: {e}"
+        )
+        return pd.DataFrame()
     
     df = pd.DataFrame(response.data)
     if not df.empty:
@@ -55,24 +70,41 @@ def get_villes_list():
     return pd.DataFrame()
 
 def get_city_data_full(code_insee):
-    """Récupère les infos de loyer pour une ville donnée"""
+    """Récupère les infos de loyer pour une ville donnée depuis la table Dim_ville"""
     if not supabase: return None
-    response = supabase.table('villes').select('*').eq('code_insee', code_insee).execute()
-    if response.data:
-        return response.data[0] # Retourne un dictionnaire (la première ligne trouvée)
+    TABLE_DIM_VILLE = 'Dim_ville' # Nom de la table des villes
+    try:
+        response = supabase.table(TABLE_DIM_VILLE).select('*').eq('code_insee', code_insee).execute()
+        if response.data:
+            return response.data[0] # Retourne un dictionnaire (la première ligne trouvée)
+    except APIError as e:
+        print(f"Erreur silencieuse sur get_city_data_full: {e}")
     return None
 
 def get_transactions(code_insee):
-    """Récupère l'historique des ventes pour une ville donnée"""
+    """Récupère l'historique des ventes pour une ville donnée depuis la table Fct_transaction_immo"""
     if not supabase: return pd.DataFrame()
     
-    # On récupère les ventes. Filtres basiques pour éviter le bruit (ventes à 1€, erreurs...)
-    response = supabase.table('transactions')\
-        .select('*')\
-        .eq('code_insee', code_insee)\
-        .gt('valeur_fonciere', 5000)\
-        .gt('surface_reelle_bati', 9)\
-        .execute()
+    TABLE_FACT_TRANSAC = 'Fct_transaction_immo' # Nom de la table des transactions
+    
+    try:
+        # On récupère les ventes. Filtres basiques pour éviter le bruit (ventes à 1€, erreurs...)
+        response = supabase.table(TABLE_FACT_TRANSAC)\
+            .select('*')\
+            .eq('code_insee', code_insee)\
+            .gt('valeur_fonciere', 5000)\
+            .gt('surface_reelle_bati', 9)\
+            .execute()
+    except APIError as e:
+        # Gère l'erreur pour la table 'transactions'
+        st.error(
+            f"❌ Erreur Supabase (APIError) : La requête SELECT sur la table '{TABLE_FACT_TRANSAC}' a échoué."
+            "\n\nCauses possibles :"
+            "\n1. **Permissions (RLS)** : La clé 'anon' n'a pas les droits de lecture. (Vérifiez la politique SELECT pour le rôle 'anon' sur cette table.)"
+            "\n2. **Nom de Colonne** : Vérifiez l'existence et l'orthographe exacte des colonnes utilisées dans le filtre."
+            f"\nDétail technique: {e}"
+        )
+        return pd.DataFrame()
     
     df = pd.DataFrame(response.data)
     
@@ -86,7 +118,6 @@ def get_transactions(code_insee):
         df['prix_m2'] = df['valeur_fonciere'] / df['surface_reelle_bati']
         
         # Filtrage des outliers extrêmes (ex: erreur de saisie à 100k€/m²)
-        # On garde ce qui est raisonnable (entre 500€ et 30k€ le m²)
         df = df[(df['prix_m2'] > 500) & (df['prix_m2'] < 30000)]
         
     return df
@@ -101,7 +132,7 @@ with st.sidebar:
         df_villes = get_villes_list()
     
     if df_villes.empty:
-        st.warning("Aucune ville chargée. Vérifiez votre table 'villes' dans Supabase.")
+        st.error("L'application s'arrête car la liste des villes n'a pas pu être chargée. (Voir messages d'erreur au-dessus.)")
         st.stop()
         
     # Sélecteur de ville
@@ -136,14 +167,13 @@ if code_insee_actuel:
     if info_ville and not df_transac.empty:
         
         # 1. Calculs
-        # Prix achat médian (plus fiable que la moyenne)
         prix_m2_achat = df_transac['prix_m2'].median()
         
-        # Loyer moyen (gestion des cas où la donnée est vide)
+        # Loyer moyen (gestion des cas où la donnée est vide - utilisation de 'loyer_m2_appart_moyen_all' de Dim_ville)
         loyer_m2 = info_ville.get('loyer_m2_appart_moyen_all')
         if not loyer_m2: loyer_m2 = 0
         
-        # Rentabilité Brute : (Loyer x 12) / Prix Achat
+        # Rentabilité Brute
         if prix_m2_achat > 0:
             renta_brute = ((loyer_m2 * 12) / prix_m2_achat) * 100
         else:
