@@ -45,7 +45,8 @@ if 'join_id' not in st.session_state:
 @st.cache_data(ttl=3600)  # Cache d'1 heure
 def get_villes_list():
     """
-    Récupère le référentiel des villes. Utilise le code postal pour la sélection.
+    Récupère le référentiel des villes. 
+    NOTE IMPORTANTE: Utilise range pour surmonter la limite par défaut de 1000 de l'API Supabase.
     """
     if not supabase: 
         return pd.DataFrame()
@@ -53,12 +54,13 @@ def get_villes_list():
     TABLE_DIM_VILLE = 'Dim_ville'
     
     try:
-        # CORRECTION MAJEURE: Suppression de la limite. 
-        # Cela garantit la récupération de TOUTES les lignes de référence.
+        # CORRECTION MAJEURE: Forcer la limite à 50 000 via la méthode range().
+        # Cela couvre vos 35 684 lignes et permet de charger toutes les communes.
         response = supabase.table(TABLE_DIM_VILLE)\
             .select('code_insee, code_postal, nom_commune')\
             .order('nom_commune', desc=False)\
-            .execute() # LIMIT RETIRÉ
+            .range(0, 50000)\
+            .execute()
         
     except APIError as e:
         st.error(f"❌ Erreur Supabase lors du chargement des villes (APIError). Détail: {e}")
@@ -76,7 +78,7 @@ def get_villes_list():
         df['code_insee'] = df['code_insee'].astype(str).str.zfill(5)
         
         # Création d'une étiquette propre pour la liste déroulante
-        # Nous allons dédupliquer ici pour éviter d'avoir 10 fois la même commune dans le selectbox
+        # Dédoublonnage sur le 'label' pour éviter d'avoir 10 fois la même commune dans le selectbox
         df['label'] = df['nom_commune'] + " (" + df[st.session_state.join_id].astype(str) + ")"
         df = df.drop_duplicates(subset=['label'])
         
@@ -126,6 +128,7 @@ def get_transactions(join_key_value):
     
     try:
         # Utilisation de st.session_state.join_id ('code_postal') pour la recherche
+        # Limite à 50 000 transactions pour éviter un chargement trop long.
         response = supabase.table(TABLE_FACT_TRANSAC)\
             .select('*')\
             .eq(st.session_state.join_id, join_key_value_str)\
