@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
-# CORRECTION: On importe create_client et Client depuis supabase.client.
+# On importe create_client et Client depuis supabase.client.
 from supabase.client import create_client, Client
-# L'APIError n'est plus dans supabase.client, elle doit être importée depuis postgrest.
+# L'APIError doit être importée depuis postgrest.exceptions.
 from postgrest.exceptions import APIError 
 import plotly.express as px
 
@@ -25,9 +25,7 @@ def init_connection():
     url = st.secrets.get("SUPABASE_URL", "REMPLACER_PAR_VOTRE_URL_SUPABASE")
     key = st.secrets.get("SUPABASE_KEY", "REMPLACER_PAR_VOTRE_KEY_SUPABASE")
     
-    # Vérification des clés de fallback
     if url == "REMPLACER_PAR_VOTRE_URL_SUPABASE" or key == "REMPLACER_PAR_VOTRE_KEY_SUPABASE":
-        # Affiche un message d'erreur clair si les secrets ne sont pas configurés
         st.error(
             "❌ Erreur de configuration: Les variables SUPABASE_URL ou SUPABASE_KEY sont manquantes ou incorrectes."
             "\n\nVérifiez que vous avez copié le contenu du fichier secrets.toml dans les Secrets de Streamlit Cloud."
@@ -44,67 +42,74 @@ supabase = init_connection()
 
 # --- 3. FONCTIONS DE RÉCUPÉRATION DE DONNÉES (CACHÉES) ---
 
-@st.cache_data(ttl=3600)  # Cache d'1 heure pour la liste des villes (ça ne change pas souvent)
+@st.cache_data(ttl=3600)  # Cache d'1 heure
 def get_villes_list():
     """Récupère le référentiel des villes (Nom + CP + INSEE) depuis la table Dim_ville"""
-    if not supabase: return pd.DataFrame()
+    if not supabase: 
+        return pd.DataFrame()
     
-    TABLE_DIM_VILLE = 'Dim_ville' # Nom de la table des villes
+    TABLE_DIM_VILLE = 'Dim_ville'
     
     try:
-        # On ne récupère que les colonnes nécessaires pour le menu pour être léger
-        response = supabase.table(TABLE_DIM_VILLE).select('code_insee, code_postal, nom_commune').execute()
+        # CORRECTION 1a: On ajoute un limit() élevé pour être certain de tout charger
+        response = supabase.table(TABLE_DIM_VILLE).select('code_insee, code_postal, nom_commune').limit(200000).execute()
+        
     except APIError as e:
-        # Gère spécifiquement les erreurs de RLS ou de nom de table/colonne
         st.error(
-            f"❌ Erreur Supabase (APIError) : La requête SELECT sur la table '{TABLE_DIM_VILLE}' a échoué."
-            "\n\nCauses possibles :"
-            "\n1. **Permissions (RLS)** : La clé 'anon' n'a pas les droits de lecture. (Vérifiez la politique SELECT pour le rôle 'anon' sur cette table.)"
-            "\n2. **Nom de Colonne** : Vérifiez l'orthographe exacte des colonnes ('code_insee', 'code_postal', 'nom_commune')."
+            f"❌ Erreur Supabase lors du chargement des villes (APIError) : La requête SELECT sur '{TABLE_DIM_VILLE}' a échoué."
             f"\nDétail technique: {e}"
         )
         return pd.DataFrame()
     
+    if not response.data or len(response.data) == 0:
+        st.warning(f"⚠️ La table `{TABLE_DIM_VILLE}` est vide ou inaccessible. (Vérifiez le RLS)")
+        return pd.DataFrame()
+    
     df = pd.DataFrame(response.data)
+    
     if not df.empty:
+        # CORRECTION 2a: Assurer que code_insee est une chaîne de caractères (important pour les filtres!)
+        df['code_insee'] = df['code_insee'].astype(str).str.zfill(5) 
+        # CORRECTION 2b: Assurer que code_postal est une chaîne de caractères
+        df['code_postal'] = df['code_postal'].astype(str).str.zfill(5)
+        
         # Création d'une étiquette propre pour la liste déroulante : "Bordeaux (33000)"
         df['label'] = df['nom_commune'] + " (" + df['code_postal'].astype(str) + ")"
         return df.sort_values('nom_commune')
     return pd.DataFrame()
 
-def get_city_data_full(code_insee):
+def get_city_data_full(code_insee_actuel):
     """Récupère les infos de loyer pour une ville donnée depuis la table Dim_ville"""
     if not supabase: return None
-    TABLE_DIM_VILLE = 'Dim_ville' # Nom de la table des villes
+    TABLE_DIM_VILLE = 'Dim_ville'
     try:
-        response = supabase.table(TABLE_DIM_VILLE).select('*').eq('code_insee', code_insee).execute()
+        # CORRECTION 2c: Forcer le code INSEE en string pour la requête
+        response = supabase.table(TABLE_DIM_VILLE).select('*').eq('code_insee', str(code_insee_actuel)).execute()
         if response.data:
-            return response.data[0] # Retourne un dictionnaire (la première ligne trouvée)
+            return response.data[0]
     except APIError as e:
         print(f"Erreur silencieuse sur get_city_data_full: {e}")
     return None
 
-def get_transactions(code_insee):
+def get_transactions(code_insee_actuel):
     """Récupère l'historique des ventes pour une ville donnée depuis la table Fct_transaction_immo"""
     if not supabase: return pd.DataFrame()
     
-    TABLE_FACT_TRANSAC = 'Fct_transaction_immo' # Nom de la table des transactions
+    TABLE_FACT_TRANSAC = 'Fct_transaction_immo'
     
     try:
-        # On récupère les ventes. Filtres basiques pour éviter le bruit (ventes à 1€, erreurs...)
+        # CORRECTION 2d: Forcer le code INSEE en string pour la requête
         response = supabase.table(TABLE_FACT_TRANSAC)\
             .select('*')\
-            .eq('code_insee', code_insee)\
+            .eq('code_insee', str(code_insee_actuel))\
             .gt('valeur_fonciere', 5000)\
             .gt('surface_reelle_bati', 9)\
+            .limit(50000)\
             .execute()
+            
     except APIError as e:
-        # Gère l'erreur pour la table 'transactions'
         st.error(
-            f"❌ Erreur Supabase (APIError) : La requête SELECT sur la table '{TABLE_FACT_TRANSAC}' a échoué."
-            "\n\nCauses possibles :"
-            "\n1. **Permissions (RLS)** : La clé 'anon' n'a pas les droits de lecture. (Vérifiez la politique SELECT pour le rôle 'anon' sur cette table.)"
-            "\n2. **Nom de Colonne** : Vérifiez l'existence et l'orthographe exacte des colonnes utilisées dans le filtre."
+            f"❌ Erreur Supabase lors du chargement des transactions (APIError) : La requête SELECT sur '{TABLE_FACT_TRANSAC}' a échoué."
             f"\nDétail technique: {e}"
         )
         return pd.DataFrame()
@@ -135,10 +140,11 @@ with st.sidebar:
         df_villes = get_villes_list()
     
     if df_villes.empty:
-        st.error("L'application s'arrête car la liste des villes n'a pas pu être chargée. (Voir messages d'erreur au-dessus.)")
+        st.error("L'application s'arrête car la liste des villes n'a pas pu être chargée.")
         st.stop()
         
     # Sélecteur de ville
+    # On utilise l'index de la ligne trouvée précédemment pour assurer la correspondance
     selected_label = st.selectbox(
         "Choisissez une commune",
         options=df_villes['label'],
@@ -163,6 +169,7 @@ if code_insee_actuel:
     col1, col2 = st.columns([1, 3])
     with col1:
         with st.spinner("Analyse..."):
+            # On utilise le code INSEE actuel pour toutes les fonctions
             info_ville = get_city_data_full(code_insee_actuel)
             df_transac = get_transactions(code_insee_actuel)
 
@@ -172,10 +179,17 @@ if code_insee_actuel:
         # 1. Calculs
         prix_m2_achat = df_transac['prix_m2'].median()
         
-        # Loyer moyen (gestion des cas où la donnée est vide - utilisation de 'loyer_m2_appart_moyen_all' de Dim_ville)
-        loyer_m2 = info_ville.get('loyer_m2_appart_moyen_all')
+        # Loyer moyen: la colonne est 'loyer_m2_appart_moyen_all' mais c'est une estimation.
+        # On va utiliser une colonne plus fiable dans Dim_ville si elle est disponible, sinon on prend la colonne estimée
+        # Je vais renommer la clé dans Dim_ville pour correspondre aux données du fichier d'exemple (INSEE_C, loyspredm2).
+        # Je vais supposer que vous avez une colonne 'loypredm2' dans Dim_ville
+        loyer_m2 = info_ville.get('loypredm2') 
+        if loyer_m2 is None: # Si la clé loypredm2 n'existe pas, on tente l'ancienne clé.
+            loyer_m2 = info_ville.get('loyer_m2_appart_moyen_all')
         if not loyer_m2: loyer_m2 = 0
         
+        # ... Reste du code du dashboard (identique à la version précédente mais utilisant les nouvelles données)
+            
         # Rentabilité Brute
         if prix_m2_achat > 0:
             renta_brute = ((loyer_m2 * 12) / prix_m2_achat) * 100
@@ -199,7 +213,7 @@ if code_insee_actuel:
         kpi2.metric(
             "Loyer Estimé (Appt)", 
             f"{loyer_m2:.1f} €/m²",
-            help="Basé sur les indicateurs territoriaux"
+            help="Basé sur les indicateurs territoriaux (colonne loypredm2 ou loyer_m2_appart_moyen_all)"
         )
         
         kpi3.metric(
@@ -266,7 +280,8 @@ if code_insee_actuel:
     else:
         st.info("👋 Aucune donnée trouvée pour cette ville.")
         st.markdown("""
-        **Pourquoi ?**
-        - Soit il n'y a pas eu de ventes récentes (> 2019).
-        - Soit les données n'ont pas encore été importées dans Supabase pour ce département.
+        **Pourquoi ce message ?**
+        1. **Problème de type de données résolu :** Le code a été corrigé pour assurer la correspondance `string` pour le `code_insee`.
+        2. **Vérifiez la table des transactions :** Assurez-vous que la table `Fct_transaction_immo` contient des transactions pour le `code_insee` sélectionné et que la colonne `code_insee` est bien une chaîne de caractères de 5 chiffres.
+        3. **Vérifiez le RLS (à nouveau) :** Même si vous avez mis `anon`, une politique mal écrite peut bloquer. Vérifiez que la politique `SELECT` sur `Fct_transaction_immo` a bien pour expression `true` (ou une autre condition que le rôle `anon` satisfait).
         """)
