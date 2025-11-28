@@ -37,8 +37,9 @@ supabase = init_connection()
 
 # --- 3. FONCTIONS DE RÉCUPÉRATION DE DONNÉES (CACHÉES) ---
 
-# Variable globale pour stocker l'ID de jointure utilisé (maintenant Code Postal)
-st.session_state.join_id = 'code_postal'
+# Variable globale pour stocker l'ID de jointure utilisé (Code Postal)
+if 'join_id' not in st.session_state:
+    st.session_state.join_id = 'code_postal'
 
 
 @st.cache_data(ttl=3600)  # Cache d'1 heure
@@ -52,8 +53,10 @@ def get_villes_list():
     TABLE_DIM_VILLE = 'Dim_ville'
     
     try:
-        # On sélectionne les deux clés au cas où nous devions revenir à code_insee
-        response = supabase.table(TABLE_DIM_VILLE).select('code_insee, code_postal, nom_commune').limit(500000).execute()
+        # On sélectionne les colonnes nécessaires (y compris les loyers pour les colonnes de débogage)
+        response = supabase.table(TABLE_DIM_VILLE)\
+            .select('code_insee, code_postal, nom_commune, loypredm2, loyer_m2_appart_moyen_all')\
+            .limit(500000).execute()
         
     except APIError as e:
         st.error(f"❌ Erreur Supabase lors du chargement des villes (APIError). Détail: {e}")
@@ -92,11 +95,10 @@ def get_city_data_full(join_key_value):
     print(f"DEBUG: get_city_data_full cherche {st.session_state.join_id}='{join_key_value_str}'", file=sys.stderr)
     
     try:
-        # Utilisation de st.session_state.join_id ('code_postal') pour la recherche
+        # Sélection de toutes les colonnes, y compris les loyers spécifiques mentionnés par l'utilisateur
         response = supabase.table(TABLE_DIM_VILLE).select('*').eq(st.session_state.join_id, join_key_value_str).execute()
         
         if response.data:
-            # Note: Si un code postal couvre plusieurs villes (ex: Paris), on prend la première ligne
             return response.data[0] 
         
     except APIError as e:
@@ -119,7 +121,6 @@ def get_transactions(join_key_value):
     
     try:
         # Utilisation de st.session_state.join_id ('code_postal') pour la recherche
-        # Assurez-vous que la colonne 'code_postal' existe bien dans Fct_transaction_immo
         response = supabase.table(TABLE_FACT_TRANSAC)\
             .select('*')\
             .eq(st.session_state.join_id, join_key_value_str)\
@@ -155,7 +156,30 @@ def get_transactions(join_key_value):
         
     return df
 
-# --- 4. INTERFACE UTILISATEUR (SIDEBAR) ---
+# --- 4. UTILS POUR LA CONVERSION DE LOYER ---
+
+def convert_loyer_to_float(raw_value):
+    """
+    Convertit une valeur de loyer potentiellement au format texte (avec virgule) en float.
+    Retourne 0.0 si la valeur est None ou non numérique.
+    """
+    if raw_value is None:
+        return 0.0
+    
+    try:
+        # 1. Conversion en chaîne pour assurer la méthode .replace()
+        value_str = str(raw_value)
+        # 2. Remplacement de la virgule par le point
+        cleaned_value = value_str.replace(',', '.')
+        # 3. Conversion en float
+        return float(cleaned_value)
+    except ValueError as e:
+        # En cas d'échec (ex: chaîne vide, texte), on renvoie 0.0
+        print(f"ATTENTION: Échec de la conversion de la valeur de loyer '{raw_value}'. Détail: {e}", file=sys.stderr)
+        return 0.0
+
+
+# --- 5. INTERFACE UTILISATEUR (SIDEBAR) ---
 
 with st.sidebar:
     st.header("🔍 Localisation")
@@ -185,7 +209,7 @@ with st.sidebar:
     st.caption(f"Code INSEE réel : {row_ville['code_insee']}")
     st.caption("Données sources : DVF (Etalab) & Ministère Transition Écologique")
 
-# --- 5. DASHBOARD PRINCIPAL ---
+# --- 6. DASHBOARD PRINCIPAL ---
 
 st.title(f"Analyse Immobilière : {row_ville['nom_commune']}")
 
@@ -199,53 +223,54 @@ if join_key_value:
             df_transac = get_transactions(join_key_value)
 
     # --- SECTION A : KPI MARKET ---
-    if info_ville and not df_transac.empty:
+    if info_ville:
         
         # 1. Calculs
-        prix_m2_achat = df_transac['prix_m2'].median()
         
-        # Récupération du loyer
-        loyer_m2 = info_ville.get('loypredm2') 
-        if loyer_m2 is None: 
-            loyer_m2 = info_ville.get('loyer_m2_appart_moyen_all') 
-        if loyer_m2 is None: 
-            loyer_m2 = 0 
+        # Prix Achat Médian:
+        prix_m2_achat = df_transac['prix_m2'].median() if not df_transac.empty else 0.0
+        prix_m2_achat = float(prix_m2_achat) if pd.notna(prix_m2_achat) else 0.0
         
-        # Rentabilité Brute
+        # Récupération du loyer: Utilisation de la fonction de conversion
+        raw_loyer_m2 = info_ville.get('loypredm2') 
+        if raw_loyer_m2 is None: 
+            raw_loyer_m2 = info_ville.get('loyer_m2_appart_moyen_all') 
+        
+        loyer_m2 = convert_loyer_to_float(raw_loyer_m2)
+        
+        # Calcul de la Rentabilité Brute
+        renta_brute = 0.0
         if prix_m2_achat > 0 and loyer_m2 > 0:
             renta_brute = ((loyer_m2 * 12) / prix_m2_achat) * 100
-        else:
-            renta_brute = 0
-            
-        # Tendance (Dernière année vs Total)
-        derniere_annee = df_transac['date_mutation'].dt.year.max()
         
-        if pd.notna(derniere_annee):
+        # Tendance (Dernière année vs Total)
+        derniere_annee = df_transac['date_mutation'].dt.year.max() if not df_transac.empty else "N/A"
+        
+        delta_prix = 0
+        if pd.notna(derniere_annee) and derniere_annee != "N/A" and not df_transac.empty:
             prix_m2_recent = df_transac[df_transac['date_mutation'].dt.year == derniere_annee]['prix_m2'].median()
+            prix_m2_recent = float(prix_m2_recent) if pd.notna(prix_m2_recent) else prix_m2_achat
             delta_prix = prix_m2_recent - prix_m2_achat
-        else:
-            derniere_annee = "N/A"
-            prix_m2_recent = prix_m2_achat
-            delta_prix = 0
-
+        
         # 2. Affichage
+        st.subheader("Indicateurs Clés de Marché")
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
         
         kpi1.metric(
             "Prix Achat Médian", 
-            f"{int(prix_m2_achat)} €/m²",
+            f"{int(prix_m2_achat)} €/m²" if prix_m2_achat > 0 else "N/A",
             delta=f"{int(delta_prix)} € vs historique"
         )
         
         kpi2.metric(
             "Loyer Estimé (Appt)", 
-            f"{loyer_m2:.1f} €/m²",
+            f"{loyer_m2:.1f} €/m²" if loyer_m2 > 0 else "N/A",
             help="Basé sur l'indicateur de loyer ('loypredm2' ou 'loyer_m2_appart_moyen_all') de Dim_ville"
         )
         
         kpi3.metric(
             "Rentabilité Brute", 
-            f"{renta_brute:.2f} %",
+            f"{renta_brute:.2f} %" if renta_brute > 0 else "N/A",
             delta="Opportunité" if renta_brute > 6 else "Marché tendu"
         )
         
@@ -256,60 +281,62 @@ if join_key_value:
         )
         
         st.divider()
-        
-        # --- SECTION B : GRAPHIQUES ---
-        
-        g1, g2 = st.columns([2, 1])
-        
-        with g1:
-            st.subheader("📈 Évolution des prix")
-            # Agrégation par Trimestre
-            df_transac['trimestre'] = df_transac['date_mutation'].dt.to_period('Q').astype(str)
-            df_trend = df_transac.groupby('trimestre')['prix_m2'].median().reset_index()
-            
-            fig_line = px.line(
-                df_trend, x='trimestre', y='prix_m2', markers=True,
-                title="Prix médian au m² par trimestre",
-                labels={'prix_m2': 'Prix €/m²', 'trimestre': 'Période'}
-            )
-            fig_line.update_layout(xaxis_title=None)
-            st.plotly_chart(fig_line, use_container_width=True)
-            
-        with g2:
-            st.subheader("📊 Distribution")
-            fig_hist = px.histogram(
-                df_transac, x="prix_m2", nbins=25,
-                title="Répartition des prix au m²",
-                color_discrete_sequence=['#636EFA']
-            )
-            fig_hist.add_vline(x=prix_m2_achat, line_dash="dash", line_color="red", annotation_text="Médiane")
-            st.plotly_chart(fig_hist, use_container_width=True)
 
-        # --- SECTION C : DATA EXPLORER ---
-        with st.expander("📂 Voir les dernières transactions détaillées"):
-            st.dataframe(
-                df_transac[['date_mutation', 'valeur_fonciere', 'surface_reelle_bati', 'prix_m2', 'type_local']]
-                .sort_values('date_mutation', ascending=False),
-                column_config={
-                    "date_mutation": "Date",
-                    "valeur_fonciere": st.column_config.NumberColumn("Prix", format="%d €"),
-                    "surface_reelle_bati": st.column_config.NumberColumn("Surface", format="%d m²"),
-                    "prix_m2": st.column_config.NumberColumn("Prix/m²", format="%.2f €"),
-                },
-                use_container_width=True
-            )
-            
-    # GESTION DES CAS VIDES
-    elif not info_ville:
-        st.error("❌ ERREUR DE RÉFÉRENTIEL : Les données de loyer (Dim_ville) sont introuvables pour ce Code Postal.")
+        # --- SECTION B : GRAPHIQUES (Affiches seulement si transactions > 0) ---
         if not df_transac.empty:
-            st.info("💡 Cependant, des transactions ont été trouvées pour cette ville.")
-            st.dataframe(df_transac.head())
+            
+            g1, g2 = st.columns([2, 1])
+            
+            with g1:
+                st.subheader("📈 Évolution des prix")
+                # Agrégation par Trimestre
+                df_transac['trimestre'] = df_transac['date_mutation'].dt.to_period('Q').astype(str)
+                df_trend = df_transac.groupby('trimestre')['prix_m2'].median().reset_index()
+                
+                fig_line = px.line(
+                    df_trend, x='trimestre', y='prix_m2', markers=True,
+                    title="Prix médian au m² par trimestre",
+                    labels={'prix_m2': 'Prix €/m²', 'trimestre': 'Période'}
+                )
+                fig_line.update_layout(xaxis_title=None)
+                st.plotly_chart(fig_line, use_container_width=True)
+                
+            with g2:
+                st.subheader("📊 Distribution")
+                fig_hist = px.histogram(
+                    df_transac, x="prix_m2", nbins=25,
+                    title="Répartition des prix au m²",
+                    color_discrete_sequence=['#636EFA']
+                )
+                if prix_m2_achat > 0:
+                    fig_hist.add_vline(x=prix_m2_achat, line_dash="dash", line_color="red", annotation_text="Médiane")
+                st.plotly_chart(fig_hist, use_container_width=True)
+
+            # --- SECTION C : DATA EXPLORER ---
+            with st.expander("📂 Voir les dernières transactions détaillées"):
+                st.dataframe(
+                    df_transac[['date_mutation', 'valeur_fonciere', 'surface_reelle_bati', 'prix_m2', 'type_local']]
+                    .sort_values('date_mutation', ascending=False),
+                    column_config={
+                        "date_mutation": "Date",
+                        "valeur_fonciere": st.column_config.NumberColumn("Prix", format="%d €"),
+                        "surface_reelle_bati": st.column_config.NumberColumn("Surface", format="%d m²"),
+                        "prix_m2": st.column_config.NumberColumn("Prix/m²", format="%.2f €"),
+                    },
+                    use_container_width=True
+                )
+        else:
+            # S'il y a des info_ville mais pas de transaction
+            st.info("👋 Aucune transaction (Fct_transaction_immo) trouvée pour ce Code Postal (ou toutes les transactions ont été filtrées).")
+            st.markdown(f"""
+            **Vérifications recommandées (très importantes) :**
+            - **1. Cohérence des Colonnes :** Dans Supabase, vérifiez que la colonne utilisée pour la jointure dans la table **`Fct_transaction_immo`** s'appelle bien **`code_postal`**. 
+            - **2. RLS :** Le rôle `anon` doit avoir le droit **SELECT** sur la table `Fct_transaction_immo`.
+            """)
         
-    else:
-        st.info("👋 Aucune transaction (Fct_transaction_immo) trouvée pour ce Code Postal (ou toutes les transactions ont été filtrées).")
-        st.markdown(f"""
-        **Vérifications recommandées (très importantes pour Code Postal) :**
-        - **1. Cohérence des Colonnes :** Vérifiez que la colonne `code_postal` (ou son équivalent) existe bien et est correctement remplie dans la table **`Fct_transaction_immo`**.
-        - **2. RLS sur Fct_transaction_immo :** Si les logs de la console indiquent 0 transaction, le RLS est toujours la cause la plus probable. Vérifiez à nouveau que le rôle `anon` peut **SELECT**.
-        """)
+    # GESTION DES CAS VIDES
+    else: # si info_ville n'a rien retourné
+        st.error(f"❌ ERREUR DE RÉFÉRENTIEL : Les données de loyer (Dim_ville) sont introuvables pour le Code Postal : {join_key_value}. (Vérifiez si la colonne `code_postal` est bien remplie dans Dim_ville)")
+        if not df_transac.empty:
+            st.info("💡 Cependant, des transactions ont été trouvées pour cette ville. Le problème est que le loyer ne peut pas être estimé sans les données de Dim_ville.")
+            st.dataframe(df_transac.head())
