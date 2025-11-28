@@ -3,7 +3,7 @@ import pandas as pd
 from supabase.client import create_client, Client
 from postgrest.exceptions import APIError 
 import plotly.express as px
-import sys # Pour les logs de debug
+import sys 
 
 # --- 1. CONFIGURATION DE LA PAGE ---
 st.set_page_config(
@@ -37,12 +37,14 @@ supabase = init_connection()
 
 # --- 3. FONCTIONS DE RÉCUPÉRATION DE DONNÉES (CACHÉES) ---
 
+# Variable globale pour stocker l'ID de jointure utilisé (maintenant Code Postal)
+st.session_state.join_id = 'code_postal'
+
+
 @st.cache_data(ttl=3600)  # Cache d'1 heure
 def get_villes_list():
     """
-    Récupère le référentiel des villes.
-    Si le problème persiste, videz le cache et vérifiez si le RLS est activé
-    sur Dim_ville (le rôle anon doit avoir SELECT).
+    Récupère le référentiel des villes. Utilise le code postal pour la sélection.
     """
     if not supabase: 
         return pd.DataFrame()
@@ -50,8 +52,7 @@ def get_villes_list():
     TABLE_DIM_VILLE = 'Dim_ville'
     
     try:
-        # Tente de charger un nombre très élevé pour bypasser toute limite implicite
-        # REMARQUE : Si cette ligne cause une erreur de mémoire, la limite doit être abaissée.
+        # On sélectionne les deux clés au cas où nous devions revenir à code_insee
         response = supabase.table(TABLE_DIM_VILLE).select('code_insee, code_postal, nom_commune').limit(500000).execute()
         
     except APIError as e:
@@ -65,61 +66,63 @@ def get_villes_list():
     df = pd.DataFrame(response.data)
     
     if not df.empty:
-        # Assurer que code_insee est une chaîne de caractères de 5 chiffres pour la cohérence
-        df['code_insee'] = df['code_insee'].astype(str).str.zfill(5) 
-        df['code_postal'] = df['code_postal'].astype(str).str.zfill(5)
-        
-        # Pour le debugging: Afficher le nombre de villes chargées et le type de code_insee
-        print(f"DEBUG: {len(df)} villes chargées. Type de code_insee: {df['code_insee'].dtype}", file=sys.stderr)
+        # Assurer que code_postal est une chaîne de caractères de 5 chiffres pour la cohérence
+        df[st.session_state.join_id] = df[st.session_state.join_id].astype(str).str.zfill(5)
+        df['code_insee'] = df['code_insee'].astype(str).str.zfill(5)
         
         # Création d'une étiquette propre pour la liste déroulante
-        df['label'] = df['nom_commune'] + " (" + df['code_postal'].astype(str) + ")"
+        df['label'] = df['nom_commune'] + " (" + df[st.session_state.join_id].astype(str) + ")"
+        
+        # Pour le debugging
+        print(f"DEBUG: {len(df)} villes chargées. Clé de jointure: {st.session_state.join_id}", file=sys.stderr)
+        
         return df.sort_values('nom_commune')
     return pd.DataFrame()
 
-def get_city_data_full(code_insee_actuel):
+def get_city_data_full(join_key_value):
     """
-    Récupère les infos de loyer pour une ville donnée depuis la table Dim_ville.
+    Récupère les infos de loyer pour une ville donnée depuis Dim_ville, en joignant sur le code postal.
     """
     if not supabase: return None
     TABLE_DIM_VILLE = 'Dim_ville'
     
-    # Assurer que l'identifiant de recherche est bien une chaîne de caractères
-    insee_str = str(code_insee_actuel).zfill(5)
+    # Assurer que l'identifiant de recherche (Code Postal) est bien une chaîne de caractères
+    join_key_value_str = str(join_key_value).zfill(5)
     
-    print(f"DEBUG: get_city_data_full cherche INSEE='{insee_str}'", file=sys.stderr)
+    print(f"DEBUG: get_city_data_full cherche {st.session_state.join_id}='{join_key_value_str}'", file=sys.stderr)
     
     try:
-        # On utilise une liste de noms de colonnes probables pour le code INSEE dans Dim_ville
-        # Si votre colonne est nommée différemment, changez 'code_insee' ici
-        response = supabase.table(TABLE_DIM_VILLE).select('*').eq('code_insee', insee_str).execute()
+        # Utilisation de st.session_state.join_id ('code_postal') pour la recherche
+        response = supabase.table(TABLE_DIM_VILLE).select('*').eq(st.session_state.join_id, join_key_value_str).execute()
         
         if response.data:
-            return response.data[0]
+            # Note: Si un code postal couvre plusieurs villes (ex: Paris), on prend la première ligne
+            return response.data[0] 
         
     except APIError as e:
         print(f"Erreur get_city_data_full: {e}", file=sys.stderr)
         
     return None
 
-def get_transactions(code_insee_actuel):
+def get_transactions(join_key_value):
     """
-    Récupère l'historique des ventes pour une ville donnée depuis Fct_transaction_immo.
+    Récupère l'historique des ventes pour une ville donnée depuis Fct_transaction_immo, en joignant sur le code postal.
     """
     if not supabase: return pd.DataFrame()
     
     TABLE_FACT_TRANSAC = 'Fct_transaction_immo'
     
-    # Assurer que l'identifiant de recherche est bien une chaîne de caractères
-    insee_str = str(code_insee_actuel).zfill(5)
+    # Assurer que l'identifiant de recherche (Code Postal) est bien une chaîne de caractères
+    join_key_value_str = str(join_key_value).zfill(5)
     
-    print(f"DEBUG: get_transactions cherche INSEE='{insee_str}'", file=sys.stderr)
+    print(f"DEBUG: get_transactions cherche {st.session_state.join_id}='{join_key_value_str}'", file=sys.stderr)
     
     try:
-        # Si votre colonne de jointure est 'code_commune' au lieu de 'code_insee', changez-la ici
+        # Utilisation de st.session_state.join_id ('code_postal') pour la recherche
+        # Assurez-vous que la colonne 'code_postal' existe bien dans Fct_transaction_immo
         response = supabase.table(TABLE_FACT_TRANSAC)\
             .select('*')\
-            .eq('code_insee', insee_str)\
+            .eq(st.session_state.join_id, join_key_value_str)\
             .gt('valeur_fonciere', 5000)\
             .gt('surface_reelle_bati', 9)\
             .limit(50000)\
@@ -127,22 +130,21 @@ def get_transactions(code_insee_actuel):
             
     except APIError as e:
         st.error(
-            f"❌ Erreur Supabase lors du chargement des transactions (APIError). Vérifiez le RLS et le nom des colonnes/tables."
+            f"❌ Erreur Supabase lors du chargement des transactions (APIError). Vérifiez le RLS sur Fct_transaction_immo et le nom des colonnes/tables."
             f"\nDétail technique: {e}"
         )
         return pd.DataFrame()
     
     df = pd.DataFrame(response.data)
     
-    print(f"DEBUG: {len(df)} transactions trouvées pour INSEE='{insee_str}'", file=sys.stderr)
+    print(f"DEBUG: {len(df)} transactions trouvées pour {st.session_state.join_id}='{join_key_value_str}'", file=sys.stderr)
     
     if not df.empty:
-        # Typage fort des données (essentiel pour les calculs)
+        # Typage fort des données
         df['date_mutation'] = pd.to_datetime(df['date_mutation'], errors='coerce')
         df['valeur_fonciere'] = pd.to_numeric(df['valeur_fonciere'], errors='coerce')
         df['surface_reelle_bati'] = pd.to_numeric(df['surface_reelle_bati'], errors='coerce')
         
-        # Filtrage des lignes avec des valeurs non valides après coercion
         df.dropna(subset=['date_mutation', 'valeur_fonciere', 'surface_reelle_bati'], inplace=True)
         
         # Feature Engineering : Prix au m²
@@ -158,8 +160,6 @@ def get_transactions(code_insee_actuel):
 with st.sidebar:
     st.header("🔍 Localisation")
     
-    # Chargement initial
-    # st.experimental_rerun() permet de vider le cache, mais c'est risqué. On s'en tient à cache_data.
     with st.spinner("Chargement des villes..."):
         df_villes = get_villes_list()
     
@@ -174,27 +174,29 @@ with st.sidebar:
         placeholder="Tapez le nom d'une ville..."
     )
     
-    # Récupération du Code INSEE correspondant au choix
-    # On garantit que la colonne code_insee est bien lue comme string
+    # Récupération de la clé de jointure (Code Postal) correspondant au choix
     row_ville = df_villes[df_villes['label'] == selected_label].iloc[0]
-    code_insee_actuel = row_ville['code_insee'] # Est déjà un string de 5 chiffres grâce à get_villes_list
+    
+    # On récupère la valeur du Code Postal
+    join_key_value = row_ville[st.session_state.join_id]
     
     st.divider()
-    st.caption(f"Code INSEE : {code_insee_actuel}")
+    st.caption(f"Clé de Jointure ({st.session_state.join_id.replace('_', ' ').title()}) : {join_key_value}")
+    st.caption(f"Code INSEE réel : {row_ville['code_insee']}")
     st.caption("Données sources : DVF (Etalab) & Ministère Transition Écologique")
 
 # --- 5. DASHBOARD PRINCIPAL ---
 
 st.title(f"Analyse Immobilière : {row_ville['nom_commune']}")
 
-if code_insee_actuel:
+if join_key_value:
     
-    # Chargement des données détaillées
+    # Chargement des données détaillées en utilisant la nouvelle clé de jointure
     col1, col2 = st.columns([1, 3])
     with col1:
         with st.spinner("Analyse..."):
-            info_ville = get_city_data_full(code_insee_actuel)
-            df_transac = get_transactions(code_insee_actuel)
+            info_ville = get_city_data_full(join_key_value)
+            df_transac = get_transactions(join_key_value)
 
     # --- SECTION A : KPI MARKET ---
     if info_ville and not df_transac.empty:
@@ -202,10 +204,8 @@ if code_insee_actuel:
         # 1. Calculs
         prix_m2_achat = df_transac['prix_m2'].median()
         
-        # CORRECTION DE LA CLÉ DE LOYER
-        # Le nom de la colonne de loyer est 'loypredm2' si vous avez utilisé le fichier de l'ANIL
+        # Récupération du loyer
         loyer_m2 = info_ville.get('loypredm2') 
-        # Si la clé n'est pas 'loypredm2', on essaie l'ancienne clé ou une autre clé probable
         if loyer_m2 is None: 
             loyer_m2 = info_ville.get('loyer_m2_appart_moyen_all') 
         if loyer_m2 is None: 
@@ -224,7 +224,6 @@ if code_insee_actuel:
             prix_m2_recent = df_transac[df_transac['date_mutation'].dt.year == derniere_annee]['prix_m2'].median()
             delta_prix = prix_m2_recent - prix_m2_achat
         else:
-            # Cas où aucune date de mutation valide n'a été trouvée
             derniere_annee = "N/A"
             prix_m2_recent = prix_m2_achat
             delta_prix = 0
@@ -302,16 +301,15 @@ if code_insee_actuel:
             
     # GESTION DES CAS VIDES
     elif not info_ville:
-        st.error("❌ ERREUR DE RÉFÉRENTIEL : Les données de loyer (Dim_ville) sont introuvables pour ce code INSEE.")
+        st.error("❌ ERREUR DE RÉFÉRENTIEL : Les données de loyer (Dim_ville) sont introuvables pour ce Code Postal.")
         if not df_transac.empty:
             st.info("💡 Cependant, des transactions ont été trouvées pour cette ville.")
             st.dataframe(df_transac.head())
         
     else:
-        st.info("👋 Aucune transaction (Fct_transaction_immo) trouvée pour cette ville (ou toutes les transactions ont été filtrées).")
+        st.info("👋 Aucune transaction (Fct_transaction_immo) trouvée pour ce Code Postal (ou toutes les transactions ont été filtrées).")
         st.markdown(f"""
-        **Vérifications recommandées :**
-        - **1. Console Debug :** Ouvrez votre console (F12) et vérifiez la ligne **`DEBUG: {len(df_transac)} transactions trouvées pour INSEE='{code_insee_actuel}'`**. Si ce nombre est 0, c'est que la requête Supabase ne trouve rien.
-        - **2. Nom de Colonne :** Dans Supabase, vérifiez que la colonne utilisée pour la jointure dans la table `Fct_transaction_immo` s'appelle bien **`code_insee`**. Si elle s'appelle `code_commune` ou autre chose, changez-la dans la fonction `get_transactions`.
-        - **3. RLS sur Fct_transaction_immo :** Si les logs indiquent 0, le RLS est toujours la cause la plus probable. Vérifiez à nouveau que le rôle `anon` peut **SELECT** sans aucune condition bloquante.
+        **Vérifications recommandées (très importantes pour Code Postal) :**
+        - **1. Cohérence des Colonnes :** Vérifiez que la colonne `code_postal` (ou son équivalent) existe bien et est correctement remplie dans la table **`Fct_transaction_immo`**.
+        - **2. RLS sur Fct_transaction_immo :** Si les logs de la console indiquent 0 transaction, le RLS est toujours la cause la plus probable. Vérifiez à nouveau que le rôle `anon` peut **SELECT**.
         """)
