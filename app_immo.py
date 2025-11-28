@@ -53,13 +53,12 @@ def get_villes_list():
     TABLE_DIM_VILLE = 'Dim_ville'
     
     try:
-        # CORRECTION MAJEURE: 
-        # 1. Utiliser .order('nom_commune') pour garantir l'ordre alphabétique.
-        # 2. Augmenter la limite à 100000 (le nombre total de communes est < 40000)
+        # CORRECTION MAJEURE: Suppression de la limite. 
+        # Cela garantit la récupération de TOUTES les lignes de référence.
         response = supabase.table(TABLE_DIM_VILLE)\
             .select('code_insee, code_postal, nom_commune')\
             .order('nom_commune', desc=False)\
-            .limit(100000).execute()
+            .execute() # LIMIT RETIRÉ
         
     except APIError as e:
         st.error(f"❌ Erreur Supabase lors du chargement des villes (APIError). Détail: {e}")
@@ -77,13 +76,13 @@ def get_villes_list():
         df['code_insee'] = df['code_insee'].astype(str).str.zfill(5)
         
         # Création d'une étiquette propre pour la liste déroulante
+        # Nous allons dédupliquer ici pour éviter d'avoir 10 fois la même commune dans le selectbox
         df['label'] = df['nom_commune'] + " (" + df[st.session_state.join_id].astype(str) + ")"
+        df = df.drop_duplicates(subset=['label'])
         
         # Pour le debugging
-        print(f"DEBUG: {len(df)} villes chargées. Clé de jointure: {st.session_state.join_id}", file=sys.stderr)
+        print(f"DEBUG: {len(df)} villes (uniques) chargées. Clé de jointure: {st.session_state.join_id}", file=sys.stderr)
         
-        # Le tri final sur la DataFrame n'est plus critique si le tri a été fait côté Supabase, 
-        # mais on le garde pour la robustesse.
         return df.sort_values('nom_commune')
     return pd.DataFrame()
 
@@ -104,6 +103,7 @@ def get_city_data_full(join_key_value):
         response = supabase.table(TABLE_DIM_VILLE).select('*').eq(st.session_state.join_id, join_key_value_str).execute()
         
         if response.data:
+            # On prend la première ligne (qui devrait contenir toutes les infos nécessaires)
             return response.data[0] 
         
     except APIError as e:
@@ -204,6 +204,7 @@ with st.sidebar:
     )
     
     # Récupération de la clé de jointure (Code Postal) correspondant au choix
+    # Utiliser un masque booléen pour trouver la ligne
     row_ville = df_villes[df_villes['label'] == selected_label].iloc[0]
     
     # On récupère la valeur du Code Postal
@@ -243,6 +244,7 @@ if join_key_value:
         raw_loyer_m2 = None
         
         for key in loyer_keys:
+            # Note: info_ville est un dictionnaire (JSON)
             raw_loyer_m2 = info_ville.get(key)
             if raw_loyer_m2 is not None:
                 # Si on trouve une valeur (même si c'est une chaîne vide), on arrête
