@@ -53,9 +53,13 @@ def get_villes_list():
     TABLE_DIM_VILLE = 'Dim_ville'
     
     try:
-        # CORRECTION : Ne sélectionner que les colonnes de base pour le selectbox,
-        # car c'est ici que l'erreur 'loypredm2' était déclenchée.
-        response = supabase.table(TABLE_DIM_VILLE).select('code_insee, code_postal, nom_commune').limit(500000).execute()
+        # CORRECTION MAJEURE: 
+        # 1. Utiliser .order('nom_commune') pour garantir l'ordre alphabétique.
+        # 2. Augmenter la limite à 100000 (le nombre total de communes est < 40000)
+        response = supabase.table(TABLE_DIM_VILLE)\
+            .select('code_insee, code_postal, nom_commune')\
+            .order('nom_commune', desc=False)\
+            .limit(100000).execute()
         
     except APIError as e:
         st.error(f"❌ Erreur Supabase lors du chargement des villes (APIError). Détail: {e}")
@@ -78,6 +82,8 @@ def get_villes_list():
         # Pour le debugging
         print(f"DEBUG: {len(df)} villes chargées. Clé de jointure: {st.session_state.join_id}", file=sys.stderr)
         
+        # Le tri final sur la DataFrame n'est plus critique si le tri a été fait côté Supabase, 
+        # mais on le garde pour la robustesse.
         return df.sort_values('nom_commune')
     return pd.DataFrame()
 
