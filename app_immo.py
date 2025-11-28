@@ -53,10 +53,9 @@ def get_villes_list():
     TABLE_DIM_VILLE = 'Dim_ville'
     
     try:
-        # On sélectionne les colonnes nécessaires (y compris les loyers pour les colonnes de débogage)
-        response = supabase.table(TABLE_DIM_VILLE)\
-            .select('code_insee, code_postal, nom_commune, loypredm2, loyer_m2_appart_moyen_all')\
-            .limit(500000).execute()
+        # CORRECTION : Ne sélectionner que les colonnes de base pour le selectbox,
+        # car c'est ici que l'erreur 'loypredm2' était déclenchée.
+        response = supabase.table(TABLE_DIM_VILLE).select('code_insee, code_postal, nom_commune').limit(500000).execute()
         
     except APIError as e:
         st.error(f"❌ Erreur Supabase lors du chargement des villes (APIError). Détail: {e}")
@@ -95,7 +94,7 @@ def get_city_data_full(join_key_value):
     print(f"DEBUG: get_city_data_full cherche {st.session_state.join_id}='{join_key_value_str}'", file=sys.stderr)
     
     try:
-        # Sélection de toutes les colonnes, y compris les loyers spécifiques mentionnés par l'utilisateur
+        # Utilisation de select('*') pour récupérer toutes les colonnes de loyer sans avoir à les nommer explicitement
         response = supabase.table(TABLE_DIM_VILLE).select('*').eq(st.session_state.join_id, join_key_value_str).execute()
         
         if response.data:
@@ -169,7 +168,7 @@ def convert_loyer_to_float(raw_value):
     try:
         # 1. Conversion en chaîne pour assurer la méthode .replace()
         value_str = str(raw_value)
-        # 2. Remplacement de la virgule par le point
+        # 2. Remplacement de la virgule par le point (pour gérer le format français)
         cleaned_value = value_str.replace(',', '.')
         # 3. Conversion en float
         return float(cleaned_value)
@@ -231,11 +230,18 @@ if join_key_value:
         prix_m2_achat = df_transac['prix_m2'].median() if not df_transac.empty else 0.0
         prix_m2_achat = float(prix_m2_achat) if pd.notna(prix_m2_achat) else 0.0
         
-        # Récupération du loyer: Utilisation de la fonction de conversion
-        raw_loyer_m2 = info_ville.get('loypredm2') 
-        if raw_loyer_m2 is None: 
-            raw_loyer_m2 = info_ville.get('loyer_m2_appart_moyen_all') 
+        # Récupération du loyer: Tentative de chercher 'loypredm2', sinon 'loyer_m2_appart_moyen_all'
         
+        # Noms des colonnes à tester, dans l'ordre de préférence
+        loyer_keys = ['loypredm2', 'loyer_m2_appart_moyen_all'] 
+        raw_loyer_m2 = None
+        
+        for key in loyer_keys:
+            raw_loyer_m2 = info_ville.get(key)
+            if raw_loyer_m2 is not None:
+                # Si on trouve une valeur (même si c'est une chaîne vide), on arrête
+                break 
+
         loyer_m2 = convert_loyer_to_float(raw_loyer_m2)
         
         # Calcul de la Rentabilité Brute
