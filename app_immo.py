@@ -4,6 +4,9 @@ from supabase.client import create_client, Client
 from postgrest.exceptions import APIError 
 import plotly.express as px
 import sys 
+import requests # Pour les appels API Gemini
+import json
+import time
 
 # --- 1. CONFIGURATION DE LA PAGE ---
 st.set_page_config(
@@ -12,6 +15,12 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# --- CONFIGURATION API GEMINI ---
+MODEL_NAME = "gemini-2.5-flash-preview-09-2025"
+API_KEY = "" # Laissez vide comme requis par l'environnement
+BASE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={API_KEY}"
+MAX_RETRIES = 5
 
 # --- 2. GESTION DE LA CONNEXION (SÉCURISÉE) ---
 @st.cache_resource
@@ -62,6 +71,8 @@ def get_villes_list():
     while True:
         try:
             # Utilisation de range pour la pagination (offset + limit)
+            # range(a, b) dans Supabase est inclusif des deux côtés, donc [a, b]. 
+            # Pour récupérer PAGE_SIZE=1000 lignes, on fait range(offset, offset + 999)
             response = supabase.table(TABLE_DIM_VILLE)\
                 .select('code_insee, code_postal, nom_commune')\
                 .order('nom_commune', desc=False)\
@@ -210,9 +221,71 @@ def convert_loyer_to_float(raw_value):
         # En cas d'échec (ex: chaîne vide, texte), on renvoie 0.0
         print(f"ATTENTION: Échec de la conversion de la valeur de loyer '{raw_value}'. Détail: {e}", file=sys.stderr)
         return 0.0
+        
+# --- 5. FONCTION D'ANALYSE IA ---
+
+@st.cache_data(ttl=600) # Cache 10 minutes pour l'analyse IA
+def get_ai_market_analysis(city_name, prix_m2_achat, loyer_m2, renta_brute, typ_pred, nb_transactions, delta_prix):
+    """
+    Génère une analyse de marché basée sur les indicateurs clés via l'API Gemini.
+    """
+    
+    # 1. Définition du rôle et du format de l'analyse (System Instruction)
+    system_prompt = (
+        "Vous êtes un analyste financier immobilier spécialisé dans l'investissement locatif en France. "
+        "Fournissez une analyse concise (maximum 250 mots) et professionnelle du marché pour un investisseur. "
+        "L'analyse doit être structurée en deux sections claires : **Points Forts** et **Points Faibles**. "
+        "Basez-vous *uniquement* sur les données fournies ci-dessous. Interprétez la fiabilité de l'estimation de loyer (TYPPRED)."
+    )
+    
+    # 2. Construction de la requête utilisateur avec les données
+    user_query = f"""
+    Analysez le marché pour la ville de {city_name} en vous basant sur ces métriques :
+    - Prix Achat Médian: {prix_m2_achat} €/m²
+    - Loyer Estimé: {loyer_m2} €/m²
+    - Rentabilité Brute (estimée): {renta_brute:.2f} %
+    - Fiabilité de l'estimation de loyer (TYPPRED): {typ_pred} (Rappel: 'commune' > 'epci' > 'maille')
+    - Volume de Transactions (analysées): {nb_transactions}
+    - Tendance prix vs historique: {delta_prix} €/m²
+    """
+    
+    payload = {
+        "contents": [{"parts": [{"text": user_query}]}],
+        "systemInstruction": {"parts": [{"text": system_prompt}]}
+    }
+
+    headers = {'Content-Type': 'application/json'}
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            # 3. Appel API avec gestion de l'authentification (si API_KEY est fourni par l'environnement)
+            response = requests.post(BASE_URL, headers=headers, data=json.dumps(payload), timeout=30)
+            response.raise_for_status()  # Lève une exception pour les codes d'erreur HTTP
+            
+            result = response.json()
+            
+            # Extraction du texte généré
+            text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '')
+            if text:
+                return text
+            
+        except requests.exceptions.RequestException as e:
+            if attempt < MAX_RETRIES - 1:
+                # Gestion de l'exponentiel backoff
+                sleep_time = 2 ** attempt
+                print(f"Erreur requête API: {e}. Tentative {attempt + 1}/{MAX_RETRIES}. Réessayer dans {sleep_time}s...", file=sys.stderr)
+                time.sleep(sleep_time)
+            else:
+                st.error("❌ Échec de l'analyse IA : Le service de génération de texte n'est pas disponible.")
+                return "Analyse IA indisponible (erreur de connexion ou de l'API)."
+        except Exception as e:
+            st.error(f"❌ Erreur inattendue lors de l'appel à l'API Gemini: {e}")
+            return "Analyse IA indisponible (erreur interne)."
+
+    return "Analyse IA non générée."
 
 
-# --- 5. INTERFACE UTILISATEUR (SIDEBAR) ---
+# --- 6. INTERFACE UTILISATEUR (SIDEBAR) ---
 
 with st.sidebar:
     st.header("🔍 Localisation")
@@ -242,73 +315,68 @@ with st.sidebar:
     st.divider()
     st.caption(f"Clé de Jointure ({st.session_state.join_id.replace('_', ' ').title()}) : {join_key_value}")
     st.caption(f"Code INSEE réel : {row_ville['code_insee']}")
-    st.caption("Données sources : DVF (Etalab) & Ministère Transition Écologique")
+    st.caption("Données sources : DVF (Etalab) & ANIL (Carte des Loyers)")
 
-# --- 6. DASHBOARD PRINCIPAL ---
+# --- 7. DASHBOARD PRINCIPAL ---
 
 st.title(f"Analyse Immobilière : {row_ville['nom_commune']}")
 
 if join_key_value:
     
     # Chargement des données détaillées en utilisant la nouvelle clé de jointure
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        with st.spinner("Analyse..."):
-            info_ville = get_city_data_full(join_key_value)
-            df_transac = get_transactions(join_key_value)
+    with st.spinner("Chargement des données de marché et transactions..."):
+        info_ville = get_city_data_full(join_key_value)
+        df_transac = get_transactions(join_key_value)
 
-    # --- SECTION A : KPI MARKET ---
+    # --- CALCUL DES KPIS (NÉCESSAIRE POUR L'IA) ---
+    prix_m2_achat = df_transac['prix_m2'].median() if not df_transac.empty else 0.0
+    prix_m2_achat = float(prix_m2_achat) if pd.notna(prix_m2_achat) else 0.0
+    
+    loyer_keys = ['loypredm2', 'loyer_m2_appart_moyen_all'] 
+    raw_loyer_m2 = None
+    
+    typ_pred = "N/A"
+    
     if info_ville:
-        
-        # 1. Calculs
-        
-        # Prix Achat Médian:
-        prix_m2_achat = df_transac['prix_m2'].median() if not df_transac.empty else 0.0
-        prix_m2_achat = float(prix_m2_achat) if pd.notna(prix_m2_achat) else 0.0
-        
-        # Récupération du loyer: Tentative de chercher 'loypredm2', sinon 'loyer_m2_appart_moyen_all'
-        
-        # Noms des colonnes à tester, dans l'ordre de préférence
-        loyer_keys = ['loypredm2', 'loyer_m2_appart_moyen_all'] 
-        raw_loyer_m2 = None
-        
+        typ_pred = info_ville.get('TYPPRED', 'N/A')
         for key in loyer_keys:
-            # Note: info_ville est un dictionnaire (JSON)
             raw_loyer_m2 = info_ville.get(key)
             if raw_loyer_m2 is not None:
-                # Si on trouve une valeur (même si c'est une chaîne vide), on arrête
                 break 
 
-        loyer_m2 = convert_loyer_to_float(raw_loyer_m2)
+    loyer_m2 = convert_loyer_to_float(raw_loyer_m2)
+    
+    renta_brute = 0.0
+    if prix_m2_achat > 0 and loyer_m2 > 0:
+        renta_brute = ((loyer_m2 * 12) / prix_m2_achat) * 100
+    
+    derniere_annee = df_transac['date_mutation'].dt.year.max() if not df_transac.empty else "N/A"
+    
+    delta_prix = 0
+    if pd.notna(derniere_annee) and derniere_annee != "N/A" and not df_transac.empty:
+        prix_m2_historique = df_transac['prix_m2'].median()
+        prix_m2_recent = df_transac[df_transac['date_mutation'].dt.year == derniere_annee]['prix_m2'].median()
+        prix_m2_recent = float(prix_m2_recent) if pd.notna(prix_m2_recent) else prix_m2_achat
+        delta_prix = int(prix_m2_recent - prix_m2_historique)
+    
+    nb_transactions = len(df_transac)
+    
+    # --- SECTION A : KPI MARKET (Réutilisation du code précédent) ---
+    if info_ville or not df_transac.empty: # Afficher même si seul df_transac est présent pour les KPI
         
-        # Calcul de la Rentabilité Brute
-        renta_brute = 0.0
-        if prix_m2_achat > 0 and loyer_m2 > 0:
-            renta_brute = ((loyer_m2 * 12) / prix_m2_achat) * 100
-        
-        # Tendance (Dernière année vs Total)
-        derniere_annee = df_transac['date_mutation'].dt.year.max() if not df_transac.empty else "N/A"
-        
-        delta_prix = 0
-        if pd.notna(derniere_annee) and derniere_annee != "N/A" and not df_transac.empty:
-            prix_m2_recent = df_transac[df_transac['date_mutation'].dt.year == derniere_annee]['prix_m2'].median()
-            prix_m2_recent = float(prix_m2_recent) if pd.notna(prix_m2_recent) else prix_m2_achat
-            delta_prix = prix_m2_recent - prix_m2_achat
-        
-        # 2. Affichage
         st.subheader("Indicateurs Clés de Marché")
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
         
         kpi1.metric(
             "Prix Achat Médian", 
             f"{int(prix_m2_achat)} €/m²" if prix_m2_achat > 0 else "N/A",
-            delta=f"{int(delta_prix)} € vs historique"
+            delta=f"{delta_prix} € vs historique"
         )
         
         kpi2.metric(
             "Loyer Estimé (Appt)", 
             f"{loyer_m2:.1f} €/m²" if loyer_m2 > 0 else "N/A",
-            help="Basé sur l'indicateur de loyer ('loypredm2' ou 'loyer_m2_appart_moyen_all') de Dim_ville"
+            help=f"Basé sur une prédiction de type : {typ_pred}"
         )
         
         kpi3.metric(
@@ -319,13 +387,32 @@ if join_key_value:
         
         kpi4.metric(
             "Volume de Ventes", 
-            f"{len(df_transac)}",
-            help="Nombre total de transactions analysées"
+            f"{nb_transactions}",
+            help="Nombre total de transactions analysées (limite max: 50 000)"
         )
         
+        # --- SECTION B : ANALYSE IA (NOUVEAU) ---
+        st.divider()
+        st.subheader("🤖 Analyse du Marché pour l'Investisseur (Générée par IA)")
+        
+        if prix_m2_achat > 0 and loyer_m2 > 0:
+            with st.spinner("Génération de l'analyse des Points Forts/Faibles..."):
+                analysis_text = get_ai_market_analysis(
+                    row_ville['nom_commune'], 
+                    prix_m2_achat, 
+                    loyer_m2, 
+                    renta_brute, 
+                    typ_pred, 
+                    nb_transactions, 
+                    delta_prix
+                )
+                st.markdown(analysis_text)
+        else:
+            st.info("💡 L'analyse IA sera disponible dès que les métriques principales (Prix Achat Médian et Loyer Estimé) seront disponibles.")
+
         st.divider()
 
-        # --- SECTION B : GRAPHIQUES (Affiches seulement si transactions > 0) ---
+        # --- SECTION C : GRAPHIQUES (Affiches seulement si transactions > 0) ---
         if not df_transac.empty:
             
             g1, g2 = st.columns([2, 1])
@@ -355,7 +442,7 @@ if join_key_value:
                     fig_hist.add_vline(x=prix_m2_achat, line_dash="dash", line_color="red", annotation_text="Médiane")
                 st.plotly_chart(fig_hist, use_container_width=True)
 
-            # --- SECTION C : DATA EXPLORER ---
+            # --- SECTION D : DATA EXPLORER ---
             with st.expander("📂 Voir les dernières transactions détaillées"):
                 st.dataframe(
                     df_transac[['date_mutation', 'valeur_fonciere', 'surface_reelle_bati', 'prix_m2', 'type_local']]
@@ -371,11 +458,6 @@ if join_key_value:
         else:
             # S'il y a des info_ville mais pas de transaction
             st.info("👋 Aucune transaction (Fct_transaction_immo) trouvée pour ce Code Postal (ou toutes les transactions ont été filtrées).")
-            st.markdown(f"""
-            **Vérifications recommandées (très importantes) :**
-            - **1. Cohérence des Colonnes :** Dans Supabase, vérifiez que la colonne utilisée pour la jointure dans la table **`Fct_transaction_immo`** s'appelle bien **`code_postal`**. 
-            - **2. RLS :** Le rôle `anon` doit avoir le droit **SELECT** sur la table `Fct_transaction_immo`.
-            """)
         
     # GESTION DES CAS VIDES
     else: # si info_ville n'a rien retourné
