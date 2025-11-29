@@ -45,32 +45,57 @@ if 'join_id' not in st.session_state:
 @st.cache_data(ttl=3600)  # Cache d'1 heure
 def get_villes_list():
     """
-    Récupère le référentiel des villes. 
-    NOTE IMPORTANTE: Utilise range pour surmonter la limite par défaut de 1000 de l'API Supabase.
+    Récupère l'intégralité du référentiel des villes via pagination (boucle) 
+    pour surmonter la limite de 1000 lignes de l'API Supabase.
     """
     if not supabase: 
         return pd.DataFrame()
     
     TABLE_DIM_VILLE = 'Dim_ville'
     
-    try:
-        # CORRECTION MAJEURE: Forcer la limite à 50 000 via la méthode range().
-        # Cela couvre vos 35 684 lignes et permet de charger toutes les communes.
-        response = supabase.table(TABLE_DIM_VILLE)\
-            .select('code_insee, code_postal, nom_commune')\
-            .order('nom_commune', desc=False)\
-            .range(0, 50000)\
-            .execute()
-        
-    except APIError as e:
-        st.error(f"❌ Erreur Supabase lors du chargement des villes (APIError). Détail: {e}")
-        return pd.DataFrame()
+    # Configuration de la pagination
+    PAGE_SIZE = 1000  # Nombre de lignes récupérées par requête
+    all_data = []
+    offset = 0
+    total_data_loaded = 0
     
-    if not response.data or len(response.data) == 0:
+    while True:
+        try:
+            # Utilisation de range pour la pagination (offset + limit)
+            response = supabase.table(TABLE_DIM_VILLE)\
+                .select('code_insee, code_postal, nom_commune')\
+                .order('nom_commune', desc=False)\
+                .range(offset, offset + PAGE_SIZE - 1)\
+                .execute()
+            
+            current_page_data = response.data
+            
+            if not current_page_data:
+                # Si la requête est vide, c'est la fin des données
+                break
+                
+            all_data.extend(current_page_data)
+            total_data_loaded += len(current_page_data)
+            
+            # Vérification de la condition d'arrêt : si on a moins que la taille de la page, c'est la fin
+            if len(current_page_data) < PAGE_SIZE:
+                break
+                
+            # Préparation de l'offset pour la prochaine page
+            offset += PAGE_SIZE
+            
+        except APIError as e:
+            st.error(f"❌ Erreur Supabase lors du chargement des villes (APIError) à l'offset {offset}. Détail: {e}")
+            break # Arrêter en cas d'erreur
+        except Exception as e:
+            st.error(f"❌ Erreur inattendue lors du chargement des villes à l'offset {offset}. Détail: {e}")
+            break
+
+    if not all_data:
         st.warning(f"⚠️ La table `{TABLE_DIM_VILLE}` est vide ou inaccessible. (Vérifiez le RLS)")
         return pd.DataFrame()
     
-    df = pd.DataFrame(response.data)
+    df = pd.DataFrame(all_data)
     
     if not df.empty:
         # Assurer que code_postal est une chaîne de caractères de 5 chiffres pour la cohérence
@@ -83,14 +108,14 @@ def get_villes_list():
         df = df.drop_duplicates(subset=['label'])
         
         # Pour le debugging
-        print(f"DEBUG: {len(df)} villes (uniques) chargées. Clé de jointure: {st.session_state.join_id}", file=sys.stderr)
+        print(f"DEBUG: {len(df)} villes (uniques) chargées via pagination. Clé de jointure: {st.session_state.join_id}", file=sys.stderr)
         
         return df.sort_values('nom_commune')
     return pd.DataFrame()
 
 def get_city_data_full(join_key_value):
     """
-    Récupère les infos de loyer pour une ville donnée depuis Dim_ville, en joignant sur le code postal.
+    Récupère les infos de loyer pour une ville donnée depuis Dim_ville.
     """
     if not supabase: return None
     TABLE_DIM_VILLE = 'Dim_ville'
@@ -101,11 +126,11 @@ def get_city_data_full(join_key_value):
     print(f"DEBUG: get_city_data_full cherche {st.session_state.join_id}='{join_key_value_str}'", file=sys.stderr)
     
     try:
-        # Utilisation de select('*') pour récupérer toutes les colonnes de loyer sans avoir à les nommer explicitement
+        # Utilisation de select('*') pour récupérer toutes les colonnes de loyer 
         response = supabase.table(TABLE_DIM_VILLE).select('*').eq(st.session_state.join_id, join_key_value_str).execute()
         
         if response.data:
-            # On prend la première ligne (qui devrait contenir toutes les infos nécessaires)
+            # On prend la première ligne 
             return response.data[0] 
         
     except APIError as e:
@@ -115,7 +140,7 @@ def get_city_data_full(join_key_value):
 
 def get_transactions(join_key_value):
     """
-    Récupère l'historique des ventes pour une ville donnée depuis Fct_transaction_immo, en joignant sur le code postal.
+    Récupère l'historique des ventes pour une ville donnée depuis Fct_transaction_immo.
     """
     if not supabase: return pd.DataFrame()
     
@@ -192,7 +217,8 @@ def convert_loyer_to_float(raw_value):
 with st.sidebar:
     st.header("🔍 Localisation")
     
-    with st.spinner("Chargement des villes..."):
+    # Ajout d'un spinner pour le chargement potentiellement plus long
+    with st.spinner("Chargement des villes par pagination (cela peut prendre quelques secondes)..."):
         df_villes = get_villes_list()
     
     if df_villes.empty:
