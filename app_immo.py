@@ -37,8 +37,7 @@ supabase = init_connection()
 
 # --- 3. FONCTIONS DE RÉCUPÉRATION DE DONNÉES (CACHÉES) ---
 
-# Rétablissement de la clé de jointure sur le Code Postal, qui semble plus complet 
-# pour la majorité des villes dans les tables.
+# Clé de jointure sur Code Postal
 if 'join_id' not in st.session_state:
     st.session_state.join_id = 'code_postal'
 
@@ -99,7 +98,7 @@ def get_villes_list():
     df = pd.DataFrame(all_data)
     
     if not df.empty:
-        # Assurer que code_postal (la nouvelle/ancienne clé) est une chaîne de caractères de 5 chiffres
+        # Assurer que code_postal (la clé de jointure) est une chaîne de caractères de 5 chiffres
         df[st.session_state.join_id] = df[st.session_state.join_id].astype(str).str.zfill(5)
         # Assurer que code_insee est une chaîne de caractères de 5 chiffres
         df['code_insee'] = df['code_insee'].astype(str).str.zfill(5)
@@ -122,8 +121,11 @@ def get_city_data_full(join_key_value):
     if not supabase: return None
     TABLE_DIM_VILLE = 'Dim_ville'
     
-    # Liste des colonnes de loyer UNIQUEMENT
-    select_columns = 'code_insee, code_postal, nom_commune, loypredm2, loypredm2_t1t2, loypredm2_t3plus, loypredm2_maison'
+    # Colonnes de loyer réelles dans la base de données de l'utilisateur
+    select_columns = (
+        'code_insee, code_postal, nom_commune, '
+        'loyer_m2_maison_moyen, loyer_m2_appart_t1_t2, loyer_m2_appart_t3_plus'
+    )
     
     # Assurer que l'identifiant de recherche (Code Postal) est bien une chaîne de caractères
     join_key_value_str = str(join_key_value).zfill(5)
@@ -139,6 +141,9 @@ def get_city_data_full(join_key_value):
             return response.data[0] 
         
     except APIError as e:
+        # Ajout d'une erreur si la structure de table est encore incorrecte (colonnes manquantes)
+        if 'column "loyer_m2' in str(e):
+             st.error("❌ ERREUR STRUCTURE DE TABLE : Une ou plusieurs colonnes de loyer sont introuvables. Vérifiez l'orthographe exacte.")
         print(f"Erreur get_city_data_full: {e}", file=sys.stderr)
         
     return None
@@ -222,7 +227,7 @@ with st.sidebar:
     st.header("🔍 Localisation")
     
     # Ajout d'un spinner pour le chargement potentiellement plus long
-    with st.spinner("Chargement des villes par pagination (cela peut prendre quelques secondes)..."):
+    with st.spinner("Chargement des villes par pagination..."):
         df_villes = get_villes_list()
     
     if df_villes.empty:
@@ -237,15 +242,14 @@ with st.sidebar:
     )
     
     # Récupération de la clé de jointure (Code Postal) correspondant au choix
-    # Utiliser un masque booléen pour trouver la ligne
     row_ville = df_villes[df_villes['label'] == selected_label].iloc[0]
     
     # On récupère la valeur du Code Postal (clé de jointure)
     join_key_value = row_ville[st.session_state.join_id] # Code Postal
     
     st.divider()
-    st.caption(f"Clé de Jointure (Code Postal) : {join_key_value}")
-    st.caption(f"Code INSEE réel : {row_ville['code_insee']}")
+    st.caption(f"Clé de Jointure utilisée (Code Postal) : {join_key_value}")
+    st.caption(f"Code INSEE de référence : {row_ville['code_insee']}")
     st.caption("Données sources : DVF (Etalab) & ANIL (Carte des Loyers)")
 
 # --- 6. DASHBOARD PRINCIPAL ---
@@ -277,18 +281,25 @@ if join_key_value:
     
     nb_transactions = len(df_transac)
     
-    # Données de Loyer (Dim_ville)
-    # loypredm2 est le loyer Appartement 'toutes typologies'
-    loyer_m2_all = convert_loyer_to_float(info_ville.get('loypredm2')) if info_ville else 0.0
+    # Données de Loyer (Dim_ville) - UTILISATION DES NOUVEAUX NOMS DE COLONNES
+    
+    loyer_m2_t1t2 = convert_loyer_to_float(info_ville.get('loyer_m2_appart_t1_t2')) if info_ville else 0.0
+    loyer_m2_t3plus = convert_loyer_to_float(info_ville.get('loyer_m2_appart_t3_plus')) if info_ville else 0.0
+    loyer_m2_maison = convert_loyer_to_float(info_ville.get('loyer_m2_maison_moyen')) if info_ville else 0.0
+
+    # Estimation du loyer moyen Appartement global
+    # S'il y a des données pour T1/T2 ou T3+, on prend la moyenne, sinon 0.0
+    loyers_appart = [l for l in [loyer_m2_t1t2, loyer_m2_t3plus] if l > 0]
+    loyer_m2_all = sum(loyers_appart) / len(loyers_appart) if loyers_appart else 0.0
     
     loyer_m2_data = {
-        "Appartement T1-T2": convert_loyer_to_float(info_ville.get('loypredm2_t1t2')) if info_ville else 0.0,
-        "Appartement T3 et +": convert_loyer_to_float(info_ville.get('loypredm2_t3plus')) if info_ville else 0.0,
-        "Maison": convert_loyer_to_float(info_ville.get('loypredm2_maison')) if info_ville else 0.0,
-        "Appartement (Toutes types)": loyer_m2_all, 
+        "Appartement T1-T2": loyer_m2_t1t2,
+        "Appartement T3 et +": loyer_m2_t3plus,
+        "Maison": loyer_m2_maison,
+        "Appartement (Global Estimé)": loyer_m2_all, 
     }
     
-    # On utilise le loyer toutes types pour le calcul de rentabilité, car les autres pourraient être nuls
+    # Calcul de la rentabilité brute
     renta_brute = 0.0
     if prix_m2_achat > 0 and loyer_m2_all > 0:
         renta_brute = ((loyer_m2_all * 12) / prix_m2_achat) * 100
@@ -305,7 +316,7 @@ if join_key_value:
             delta=f"{delta_prix} € vs historique"
         )
         
-        # Le KPI du loyer utilise le loyer 'toutes typologies' comme référence
+        # Le KPI du loyer utilise le loyer 'Global Estimé' comme référence
         kpi2.metric(
             "Loyer Moyen Estimé (Appt)", 
             f"{loyer_m2_all:.1f} €/m²" if loyer_m2_all > 0 else "N/A",
@@ -328,7 +339,7 @@ if join_key_value:
         # --- SECTION B : ANALYSE DES LOYERS DÉTAILLÉS ---
         st.subheader("📊 Comparaison des Loyers Estimés par Typologie")
         
-        # B1. Graphique des loyers par typologie (on filtre le loyer "toutes types" pour ne garder que le détail)
+        # B1. Graphique des loyers par typologie (on filtre le loyer global estimé)
         df_loyer = pd.DataFrame(
             [
                 ("Appartement T1-T2", loyer_m2_data.get("Appartement T1-T2", 0.0)),
@@ -338,7 +349,7 @@ if join_key_value:
             columns=['Typologie', 'Loyer_m2']
         ).sort_values('Loyer_m2', ascending=False)
         
-        df_loyer_filtered = df_loyer[df_loyer['Loyer_m2'] > 0] # Filtrer les valeurs absentes
+        df_loyer_filtered = df_loyer[df_loyer['Loyer_m2'] > 0] # Filtrer les valeurs absentes (si 0.0)
 
         if not df_loyer_filtered.empty:
             fig_bar = px.bar(
@@ -364,8 +375,13 @@ if join_key_value:
             )
             
         else:
-            # Message d'alerte si les loyers détaillés sont N/A
-            st.warning("⚠️ Données de loyer détaillées (Maison, T1/T2, T3+) non disponibles dans la source ANIL pour cette ville.")
+            # Message d'alerte si les loyers sont N/A
+            st.warning("⚠️ Les données de loyer (Loyers Moyens et détaillés) sont absentes dans la table `Dim_ville` pour cette ville. La ligne a été trouvée, mais les colonnes de loyer sont vides/nulles.")
+            
+            # Aide au débogage : Affichage de la ligne de Dim_ville trouvée
+            if info_ville:
+                st.info(f"💡 DEBUG: La ligne de `Dim_ville` trouvée pour {join_key_value} contient ces données brutes :")
+                st.json(info_ville)
 
         st.divider()
 
@@ -418,6 +434,6 @@ if join_key_value:
         
     # GESTION DES CAS VIDES
     else: # si info_ville n'a rien retourné
-        st.error(f"❌ ERREUR DE RÉFÉRENTIEL : Les données de loyer (Dim_ville) sont introuvables pour le Code Postal : {join_key_value}. (Vérifiez la table `Dim_ville`.)")
+        st.error(f"❌ ERREUR DE RÉFÉRENTIEL : La ligne de données de loyer (Dim_ville) est introuvable pour le Code Postal : {join_key_value}. (Vérifiez la table `Dim_ville`.)")
         if not df_transac.empty:
             st.info("💡 Des transactions ont cependant été trouvées. Le problème semble être que les données de loyer manquent dans `Dim_ville` pour cet identifiant.")
