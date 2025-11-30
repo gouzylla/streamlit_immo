@@ -4,8 +4,6 @@ from supabase.client import create_client, Client
 from postgrest.exceptions import APIError 
 import plotly.express as px
 import sys 
-# Retrait des imports requests et json (non nécessaires sans l'IA)
-# Retrait de l'import time (non nécessaire sans l'IA)
 
 # --- 1. CONFIGURATION DE LA PAGE ---
 st.set_page_config(
@@ -14,9 +12,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-# --- CONFIGURATION API GEMINI (RETIREE) ---
-# Retrait de la configuration du modèle Gemini
 
 # --- 2. GESTION DE LA CONNEXION (SÉCURISÉE) ---
 @st.cache_resource
@@ -42,7 +37,8 @@ supabase = init_connection()
 
 # --- 3. FONCTIONS DE RÉCUPÉRATION DE DONNÉES (CACHÉES) ---
 
-# Variable globale pour stocker l'ID de jointure utilisé (Code Postal)
+# Rétablissement de la clé de jointure sur le Code Postal, qui semble plus complet 
+# pour la majorité des villes dans les tables.
 if 'join_id' not in st.session_state:
     st.session_state.join_id = 'code_postal'
 
@@ -103,8 +99,9 @@ def get_villes_list():
     df = pd.DataFrame(all_data)
     
     if not df.empty:
-        # Assurer que code_postal est une chaîne de caractères de 5 chiffres pour la cohérence
+        # Assurer que code_postal (la nouvelle/ancienne clé) est une chaîne de caractères de 5 chiffres
         df[st.session_state.join_id] = df[st.session_state.join_id].astype(str).str.zfill(5)
+        # Assurer que code_insee est une chaîne de caractères de 5 chiffres
         df['code_insee'] = df['code_insee'].astype(str).str.zfill(5)
         
         # Création d'une étiquette propre pour la liste déroulante
@@ -120,7 +117,7 @@ def get_villes_list():
 def get_city_data_full(join_key_value):
     """
     Récupère les infos détaillées de loyer pour une ville donnée depuis Dim_ville.
-    Colonnes de loyer utilisées : loypredm2 (Appt tout), loypredm2_t1t2, loypredm2_t3plus, loypredm2_maison.
+    Utilise le Code Postal comme clé de recherche.
     """
     if not supabase: return None
     TABLE_DIM_VILLE = 'Dim_ville'
@@ -134,6 +131,7 @@ def get_city_data_full(join_key_value):
     print(f"DEBUG: get_city_data_full cherche {st.session_state.join_id}='{join_key_value_str}'", file=sys.stderr)
     
     try:
+        # Recherche par Code Postal
         response = supabase.table(TABLE_DIM_VILLE).select(select_columns).eq(st.session_state.join_id, join_key_value_str).execute()
         
         if response.data:
@@ -148,6 +146,7 @@ def get_city_data_full(join_key_value):
 def get_transactions(join_key_value):
     """
     Récupère l'historique des ventes pour une ville donnée depuis Fct_transaction_immo.
+    Utilise le Code Postal comme clé de recherche.
     """
     if not supabase: return pd.DataFrame()
     
@@ -159,8 +158,7 @@ def get_transactions(join_key_value):
     print(f"DEBUG: get_transactions cherche {st.session_state.join_id}='{join_key_value_str}'", file=sys.stderr)
     
     try:
-        # Utilisation de st.session_state.join_id ('code_postal') pour la recherche
-        # Limite à 50 000 transactions pour éviter un chargement trop long.
+        # Recherche par Code Postal
         response = supabase.table(TABLE_FACT_TRANSAC)\
             .select('*')\
             .eq(st.session_state.join_id, join_key_value_str)\
@@ -218,9 +216,7 @@ def convert_loyer_to_float(raw_value):
         print(f"ATTENTION: Échec de la conversion de la valeur de loyer '{raw_value}'. Détail: {e}", file=sys.stderr)
         return 0.0
         
-# --- 5. FONCTION D'ANALYSE IA (SUPPRIMÉE) ---
-
-# --- 6. INTERFACE UTILISATEUR (SIDEBAR) ---
+# --- 5. INTERFACE UTILISATEUR (SIDEBAR) ---
 
 with st.sidebar:
     st.header("🔍 Localisation")
@@ -244,21 +240,21 @@ with st.sidebar:
     # Utiliser un masque booléen pour trouver la ligne
     row_ville = df_villes[df_villes['label'] == selected_label].iloc[0]
     
-    # On récupère la valeur du Code Postal
-    join_key_value = row_ville[st.session_state.join_id]
+    # On récupère la valeur du Code Postal (clé de jointure)
+    join_key_value = row_ville[st.session_state.join_id] # Code Postal
     
     st.divider()
-    st.caption(f"Clé de Jointure ({st.session_state.join_id.replace('_', ' ').title()}) : {join_key_value}")
+    st.caption(f"Clé de Jointure (Code Postal) : {join_key_value}")
     st.caption(f"Code INSEE réel : {row_ville['code_insee']}")
     st.caption("Données sources : DVF (Etalab) & ANIL (Carte des Loyers)")
 
-# --- 7. DASHBOARD PRINCIPAL ---
+# --- 6. DASHBOARD PRINCIPAL ---
 
 st.title(f"Analyse Immobilière : {row_ville['nom_commune']}")
 
 if join_key_value:
     
-    # Chargement des données détaillées en utilisant la nouvelle clé de jointure
+    # Chargement des données détaillées en utilisant le Code Postal
     with st.spinner("Chargement des données de marché et transactions..."):
         info_ville = get_city_data_full(join_key_value)
         df_transac = get_transactions(join_key_value)
@@ -273,6 +269,7 @@ if join_key_value:
     
     delta_prix = 0
     if pd.notna(derniere_annee) and derniere_annee != "N/A" and not df_transac.empty:
+        # On calcule le delta par rapport à la médiane historique de toutes les transactions chargées
         prix_m2_historique = df_transac['prix_m2'].median()
         prix_m2_recent = df_transac[df_transac['date_mutation'].dt.year == derniere_annee]['prix_m2'].median()
         prix_m2_recent = float(prix_m2_recent) if pd.notna(prix_m2_recent) else prix_m2_achat
@@ -281,13 +278,13 @@ if join_key_value:
     nb_transactions = len(df_transac)
     
     # Données de Loyer (Dim_ville)
+    # loypredm2 est le loyer Appartement 'toutes typologies'
     loyer_m2_all = convert_loyer_to_float(info_ville.get('loypredm2')) if info_ville else 0.0
     
     loyer_m2_data = {
         "Appartement T1-T2": convert_loyer_to_float(info_ville.get('loypredm2_t1t2')) if info_ville else 0.0,
         "Appartement T3 et +": convert_loyer_to_float(info_ville.get('loypredm2_t3plus')) if info_ville else 0.0,
         "Maison": convert_loyer_to_float(info_ville.get('loypredm2_maison')) if info_ville else 0.0,
-        # On inclut le loyer "toutes types" pour le KPI principal si les autres sont manquants
         "Appartement (Toutes types)": loyer_m2_all, 
     }
     
@@ -367,13 +364,12 @@ if join_key_value:
             )
             
         else:
-            st.warning("⚠️ Données de loyer détaillées (Maison, T1/T2, T3+) non disponibles dans la source pour cette ville.")
+            # Message d'alerte si les loyers détaillés sont N/A
+            st.warning("⚠️ Données de loyer détaillées (Maison, T1/T2, T3+) non disponibles dans la source ANIL pour cette ville.")
 
         st.divider()
 
-        # --- SECTION C : ANALYSE IA (SUPPRIMÉE) ---
-
-        # --- SECTION D : GRAPHIQUES HISTORIQUES ---
+        # --- SECTION C : GRAPHIQUES HISTORIQUES ---
         if not df_transac.empty:
             
             g1, g2 = st.columns([2, 1])
@@ -403,7 +399,7 @@ if join_key_value:
                     fig_hist.add_vline(x=prix_m2_achat, line_dash="dash", line_color="red", annotation_text="Médiane")
                 st.plotly_chart(fig_hist, use_container_width=True)
 
-            # --- SECTION E : DATA EXPLORER ---
+            # --- SECTION D : DATA EXPLORER ---
             with st.expander("📂 Voir les dernières transactions détaillées"):
                 st.dataframe(
                     df_transac[['date_mutation', 'valeur_fonciere', 'surface_reelle_bati', 'prix_m2', 'type_local']]
@@ -422,7 +418,6 @@ if join_key_value:
         
     # GESTION DES CAS VIDES
     else: # si info_ville n'a rien retourné
-        st.error(f"❌ ERREUR DE RÉFÉRENTIEL : Les données de loyer (Dim_ville) sont introuvables pour le Code Postal : {join_key_value}. (Vérifiez si la colonne `code_postal` est bien remplie dans Dim_ville)")
+        st.error(f"❌ ERREUR DE RÉFÉRENTIEL : Les données de loyer (Dim_ville) sont introuvables pour le Code Postal : {join_key_value}. (Vérifiez la table `Dim_ville`.)")
         if not df_transac.empty:
-            st.info("💡 Cependant, des transactions ont été trouvées pour cette ville. Le problème est que le loyer ne peut pas être estimé sans les données de Dim_ville.")
-            st.dataframe(df_transac.head())
+            st.info("💡 Des transactions ont cependant été trouvées. Le problème semble être que les données de loyer manquent dans `Dim_ville` pour cet identifiant.")
