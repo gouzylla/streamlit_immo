@@ -4,9 +4,8 @@ from supabase.client import create_client, Client
 from postgrest.exceptions import APIError 
 import plotly.express as px
 import sys 
-import requests # Pour les appels API Gemini
-import json
-import time
+# Retrait des imports requests et json (non nécessaires sans l'IA)
+# Retrait de l'import time (non nécessaire sans l'IA)
 
 # --- 1. CONFIGURATION DE LA PAGE ---
 st.set_page_config(
@@ -16,11 +15,8 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- CONFIGURATION API GEMINI ---
-MODEL_NAME = "gemini-2.5-flash-preview-09-2025"
-API_KEY = "" # Laissez vide comme requis par l'environnement
-BASE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={API_KEY}"
-MAX_RETRIES = 5
+# --- CONFIGURATION API GEMINI (RETIREE) ---
+# Retrait de la configuration du modèle Gemini
 
 # --- 2. GESTION DE LA CONNEXION (SÉCURISÉE) ---
 @st.cache_resource
@@ -71,8 +67,6 @@ def get_villes_list():
     while True:
         try:
             # Utilisation de range pour la pagination (offset + limit)
-            # range(a, b) dans Supabase est inclusif des deux côtés, donc [a, b]. 
-            # Pour récupérer PAGE_SIZE=1000 lignes, on fait range(offset, offset + 999)
             response = supabase.table(TABLE_DIM_VILLE)\
                 .select('code_insee, code_postal, nom_commune')\
                 .order('nom_commune', desc=False)\
@@ -88,7 +82,7 @@ def get_villes_list():
             all_data.extend(current_page_data)
             total_data_loaded += len(current_page_data)
             
-            # Vérification de la condition d'arrêt : si on a moins que la taille de la page, c'est la fin
+            # Vérification de la condition d'arrêt
             if len(current_page_data) < PAGE_SIZE:
                 break
                 
@@ -114,7 +108,6 @@ def get_villes_list():
         df['code_insee'] = df['code_insee'].astype(str).str.zfill(5)
         
         # Création d'une étiquette propre pour la liste déroulante
-        # Dédoublonnage sur le 'label' pour éviter d'avoir 10 fois la même commune dans le selectbox
         df['label'] = df['nom_commune'] + " (" + df[st.session_state.join_id].astype(str) + ")"
         df = df.drop_duplicates(subset=['label'])
         
@@ -126,13 +119,14 @@ def get_villes_list():
 
 def get_city_data_full(join_key_value):
     """
-    Récupère les infos détaillées (loyer, fiabilité, etc.) pour une ville donnée depuis Dim_ville.
+    Récupère les infos détaillées de loyer pour une ville donnée depuis Dim_ville.
+    Colonnes de loyer utilisées : loypredm2 (Appt tout), loypredm2_t1t2, loypredm2_t3plus, loypredm2_maison.
     """
     if not supabase: return None
     TABLE_DIM_VILLE = 'Dim_ville'
     
-    # Liste des colonnes de loyer et fiabilité que nous allons utiliser
-    select_columns = 'code_insee, code_postal, nom_commune, loypredm2, TYPPRED, lwr.IPm2, upr.IPm2, R2_adj, loypredm2_t1t2, loypredm2_t3plus, loypredm2_maison'
+    # Liste des colonnes de loyer UNIQUEMENT
+    select_columns = 'code_insee, code_postal, nom_commune, loypredm2, loypredm2_t1t2, loypredm2_t3plus, loypredm2_maison'
     
     # Assurer que l'identifiant de recherche (Code Postal) est bien une chaîne de caractères
     join_key_value_str = str(join_key_value).zfill(5)
@@ -140,7 +134,6 @@ def get_city_data_full(join_key_value):
     print(f"DEBUG: get_city_data_full cherche {st.session_state.join_id}='{join_key_value_str}'", file=sys.stderr)
     
     try:
-        # Utilisation des colonnes détaillées
         response = supabase.table(TABLE_DIM_VILLE).select(select_columns).eq(st.session_state.join_id, join_key_value_str).execute()
         
         if response.data:
@@ -225,83 +218,7 @@ def convert_loyer_to_float(raw_value):
         print(f"ATTENTION: Échec de la conversion de la valeur de loyer '{raw_value}'. Détail: {e}", file=sys.stderr)
         return 0.0
         
-# --- 5. FONCTION D'ANALYSE IA ---
-
-@st.cache_data(ttl=600) # Cache 10 minutes pour l'analyse IA
-def get_ai_market_analysis(city_name, prix_m2_achat, loyer_m2_data, typ_pred, lwr_ip, upr_ip, r2_adj, nb_transactions, delta_prix):
-    """
-    Génère une analyse de marché basée sur les indicateurs clés via l'API Gemini.
-    """
-    
-    # 1. Définition du rôle et du format de l'analyse (System Instruction)
-    system_prompt = (
-        "Vous êtes un analyste financier immobilier spécialisé dans l'investissement locatif en France. "
-        "Fournissez une analyse concise (maximum 250 mots) et professionnelle du marché pour un investisseur. "
-        "L'analyse doit être structurée en deux sections claires : **Points Forts** et **Points Faibles**. "
-        "Basez-vous *uniquement* sur les données fournies ci-dessous. Interprétez la fiabilité de l'estimation de loyer (TYPPRED et R2)."
-        "Mentionnez la meilleure typologie de bien pour un investissement locatif."
-    )
-    
-    # Construction de la chaîne de loyers détaillés
-    loyer_details = "\n".join([f"- {typ}: {loyer} €/m²" for typ, loyer in loyer_m2_data.items() if loyer > 0])
-    
-    # Interprétation de la fiabilité
-    if r2_adj < 0.5:
-        r2_interpretation = f"Faible (R2={r2_adj:.2f} < 0.5), suggérant une grande variabilité."
-    else:
-        r2_interpretation = f"Modérée/Bonne (R2={r2_adj:.2f} > 0.5)."
-
-    # 2. Construction de la requête utilisateur avec les données
-    user_query = f"""
-    Analysez le marché pour la ville de {city_name} en vous basant sur ces métriques :
-    - Prix Achat Médian (tous types) : {prix_m2_achat} €/m²
-    - Tendance prix vs historique: {delta_prix} €/m²
-    - Volume de Transactions (analysées): {nb_transactions}
-    
-    --- Indicateurs de Loyer ---
-    {loyer_details}
-    
-    --- Fiabilité de l'Estimation de Loyer ---
-    - Niveau de Prédiction (TYPPRED): {typ_pred} (Rappel: 'commune' > 'epci' > 'maille')
-    - Intervalle de Prédiction (95%): entre {lwr_ip:.2f} €/m² et {upr_ip:.2f} €/m²
-    - Coefficient de Détermination Ajusté (R2): {r2_interpretation}
-    """
-    
-    payload = {
-        "contents": [{"parts": [{"text": user_query}]}],
-        "systemInstruction": {"parts": [{"text": system_prompt}]}
-    }
-
-    headers = {'Content-Type': 'application/json'}
-    
-    for attempt in range(MAX_RETRIES):
-        try:
-            # 3. Appel API avec gestion de l'authentification
-            response = requests.post(BASE_URL, headers=headers, data=json.dumps(payload), timeout=30)
-            response.raise_for_status()  # Lève une exception pour les codes d'erreur HTTP
-            
-            result = response.json()
-            
-            # Extraction du texte généré
-            text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '')
-            if text:
-                return text
-            
-        except requests.exceptions.RequestException as e:
-            if attempt < MAX_RETRIES - 1:
-                # Gestion de l'exponentiel backoff
-                sleep_time = 2 ** attempt
-                print(f"Erreur requête API: {e}. Tentative {attempt + 1}/{MAX_RETRIES}. Réessayer dans {sleep_time}s...", file=sys.stderr)
-                time.sleep(sleep_time)
-            else:
-                st.error("❌ Échec de l'analyse IA : Le service de génération de texte n'est pas disponible.")
-                return "Analyse IA indisponible (erreur de connexion ou de l'API)."
-        except Exception as e:
-            st.error(f"❌ Erreur inattendue lors de l'appel à l'API Gemini: {e}")
-            return "Analyse IA indisponible (erreur interne)."
-
-    return "Analyse IA non générée."
-
+# --- 5. FONCTION D'ANALYSE IA (SUPPRIMÉE) ---
 
 # --- 6. INTERFACE UTILISATEUR (SIDEBAR) ---
 
@@ -367,22 +284,19 @@ if join_key_value:
     loyer_m2_all = convert_loyer_to_float(info_ville.get('loypredm2')) if info_ville else 0.0
     
     loyer_m2_data = {
-        "Appartement (Toutes types)": loyer_m2_all,
         "Appartement T1-T2": convert_loyer_to_float(info_ville.get('loypredm2_t1t2')) if info_ville else 0.0,
-        "Appartement T3+": convert_loyer_to_float(info_ville.get('loypredm2_t3plus')) if info_ville else 0.0,
+        "Appartement T3 et +": convert_loyer_to_float(info_ville.get('loypredm2_t3plus')) if info_ville else 0.0,
         "Maison": convert_loyer_to_float(info_ville.get('loypredm2_maison')) if info_ville else 0.0,
+        # On inclut le loyer "toutes types" pour le KPI principal si les autres sont manquants
+        "Appartement (Toutes types)": loyer_m2_all, 
     }
     
-    typ_pred = info_ville.get('TYPPRED', 'N/A') if info_ville else 'N/A'
-    lwr_ip = convert_loyer_to_float(info_ville.get('lwr.IPm2')) if info_ville else 0.0
-    upr_ip = convert_loyer_to_float(info_ville.get('upr.IPm2')) if info_ville else 0.0
-    r2_adj = convert_loyer_to_float(info_ville.get('R2_adj')) if info_ville else 0.0
-
+    # On utilise le loyer toutes types pour le calcul de rentabilité, car les autres pourraient être nuls
     renta_brute = 0.0
     if prix_m2_achat > 0 and loyer_m2_all > 0:
         renta_brute = ((loyer_m2_all * 12) / prix_m2_achat) * 100
     
-    # --- SECTION A : KPI MARKET (Réutilisation du code précédent) ---
+    # --- SECTION A : KPI MARKET ---
     if info_ville or not df_transac.empty: 
         
         st.subheader("Indicateurs Clés de Marché")
@@ -394,10 +308,10 @@ if join_key_value:
             delta=f"{delta_prix} € vs historique"
         )
         
+        # Le KPI du loyer utilise le loyer 'toutes typologies' comme référence
         kpi2.metric(
             "Loyer Moyen Estimé (Appt)", 
             f"{loyer_m2_all:.1f} €/m²" if loyer_m2_all > 0 else "N/A",
-            help=f"Basé sur une prédiction de type : {typ_pred}"
         )
         
         kpi3.metric(
@@ -414,84 +328,50 @@ if join_key_value:
         
         st.divider()
 
-        # --- SECTION B : ANALYSE DES LOYERS ET FIABILITÉ (NOUVEAU) ---
-        st.subheader("📊 Loyer Détaillé et Fiabilité de l'Estimation")
+        # --- SECTION B : ANALYSE DES LOYERS DÉTAILLÉS ---
+        st.subheader("📊 Comparaison des Loyers Estimés par Typologie")
         
-        col_loyer, col_fiab = st.columns([3, 2])
+        # B1. Graphique des loyers par typologie (on filtre le loyer "toutes types" pour ne garder que le détail)
+        df_loyer = pd.DataFrame(
+            [
+                ("Appartement T1-T2", loyer_m2_data.get("Appartement T1-T2", 0.0)),
+                ("Appartement T3 et +", loyer_m2_data.get("Appartement T3 et +", 0.0)),
+                ("Maison", loyer_m2_data.get("Maison", 0.0))
+            ], 
+            columns=['Typologie', 'Loyer_m2']
+        ).sort_values('Loyer_m2', ascending=False)
         
-        # B1. Graphique des loyers par typologie
-        with col_loyer:
-            # Création du DataFrame pour le graphique
-            df_loyer = pd.DataFrame(
-                list(loyer_m2_data.items()), 
-                columns=['Typologie', 'Loyer_m2']
-            ).sort_values('Loyer_m2', ascending=False)
-            df_loyer = df_loyer[df_loyer['Loyer_m2'] > 0] # Filtrer les valeurs absentes
+        df_loyer_filtered = df_loyer[df_loyer['Loyer_m2'] > 0] # Filtrer les valeurs absentes
 
-            if not df_loyer.empty:
-                fig_bar = px.bar(
-                    df_loyer, x='Typologie', y='Loyer_m2',
-                    title="Loyer Estimé (€/m²) par Type de Bien",
-                    labels={'Loyer_m2': 'Loyer €/m²'},
-                    color='Typologie',
-                    color_discrete_sequence=px.colors.qualitative.T10
-                )
-                fig_bar.update_layout(xaxis_title=None, showlegend=False)
-                st.plotly_chart(fig_bar, use_container_width=True)
-            else:
-                st.warning("⚠️ Données de loyer détaillées (Maison, T1/T2, T3+) non disponibles dans la source.")
-
-        # B2. Indicateurs de Fiabilité
-        with col_fiab:
-            st.markdown("##### Indicateurs de Fiabilité de l'Estimation (ANIL)")
+        if not df_loyer_filtered.empty:
+            fig_bar = px.bar(
+                df_loyer_filtered, x='Typologie', y='Loyer_m2',
+                title="Loyer Estimé (€/m²) par Type de Bien",
+                labels={'Loyer_m2': 'Loyer €/m²'},
+                color='Typologie',
+                color_discrete_sequence=px.colors.qualitative.T10
+            )
+            fig_bar.update_layout(xaxis_title=None, showlegend=False)
+            st.plotly_chart(fig_bar, use_container_width=True)
             
-            # Affichage du R2
-            st.metric(
-                "R2 Ajusté (Qualité du Modèle)", 
-                f"{r2_adj:.2f}",
-                help="Coefficient de détermination : plus il est proche de 1, meilleure est la prédiction."
+            # Affichage en tableau des données pour la clarté
+            st.markdown("##### Détail des Loyers (€/m²)")
+            st.dataframe(
+                df_loyer_filtered,
+                column_config={
+                    "Typologie": "Type de Bien",
+                    "Loyer_m2": st.column_config.NumberColumn("Loyer Estimé", format="%.2f €")
+                },
+                hide_index=True,
+                use_container_width=True
             )
             
-            # Affichage TYPPRED
-            reliability_icon = "🟢" if typ_pred == "commune" else ("🟡" if typ_pred == "epci" else "🔴")
-            st.metric(
-                "Niveau de Prédiction (TYPPRED)",
-                f"{typ_pred.title()} {reliability_icon}",
-                help="Commune (le plus fiable) > EPCI > Maille (le moins fiable)."
-            )
-            
-            # Affichage de l'intervalle
-            if lwr_ip > 0 and upr_ip > 0:
-                interval_width = upr_ip - lwr_ip
-                st.metric(
-                    "Intervalle de Confiance (95%)",
-                    f"[{lwr_ip:.2f} €/m² à {upr_ip:.2f} €/m²]",
-                    help=f"Amplitude de {interval_width:.2f} €/m². Plus l'intervalle est petit, plus la prédiction est précise."
-                )
-
-        st.divider()
-
-        # --- SECTION C : ANALYSE IA ---
-        st.subheader("🤖 Analyse du Marché pour l'Investisseur (Générée par IA)")
-        
-        if prix_m2_achat > 0 and loyer_m2_all > 0:
-            with st.spinner("Génération de l'analyse des Points Forts/Faibles..."):
-                analysis_text = get_ai_market_analysis(
-                    row_ville['nom_commune'], 
-                    prix_m2_achat, 
-                    loyer_m2_data, 
-                    typ_pred, 
-                    lwr_ip, 
-                    upr_ip, 
-                    r2_adj,
-                    nb_transactions, 
-                    delta_prix
-                )
-                st.markdown(analysis_text)
         else:
-            st.info("💡 L'analyse IA sera disponible dès que les métriques principales (Prix Achat Médian et Loyer Estimé) seront disponibles.")
+            st.warning("⚠️ Données de loyer détaillées (Maison, T1/T2, T3+) non disponibles dans la source pour cette ville.")
 
         st.divider()
+
+        # --- SECTION C : ANALYSE IA (SUPPRIMÉE) ---
 
         # --- SECTION D : GRAPHIQUES HISTORIQUES ---
         if not df_transac.empty:
