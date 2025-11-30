@@ -126,10 +126,13 @@ def get_villes_list():
 
 def get_city_data_full(join_key_value):
     """
-    Récupère les infos de loyer pour une ville donnée depuis Dim_ville.
+    Récupère les infos détaillées (loyer, fiabilité, etc.) pour une ville donnée depuis Dim_ville.
     """
     if not supabase: return None
     TABLE_DIM_VILLE = 'Dim_ville'
+    
+    # Liste des colonnes de loyer et fiabilité que nous allons utiliser
+    select_columns = 'code_insee, code_postal, nom_commune, loypredm2, TYPPRED, lwr.IPm2, upr.IPm2, R2_adj, loypredm2_t1t2, loypredm2_t3plus, loypredm2_maison'
     
     # Assurer que l'identifiant de recherche (Code Postal) est bien une chaîne de caractères
     join_key_value_str = str(join_key_value).zfill(5)
@@ -137,8 +140,8 @@ def get_city_data_full(join_key_value):
     print(f"DEBUG: get_city_data_full cherche {st.session_state.join_id}='{join_key_value_str}'", file=sys.stderr)
     
     try:
-        # Utilisation de select('*') pour récupérer toutes les colonnes de loyer 
-        response = supabase.table(TABLE_DIM_VILLE).select('*').eq(st.session_state.join_id, join_key_value_str).execute()
+        # Utilisation des colonnes détaillées
+        response = supabase.table(TABLE_DIM_VILLE).select(select_columns).eq(st.session_state.join_id, join_key_value_str).execute()
         
         if response.data:
             # On prend la première ligne 
@@ -225,7 +228,7 @@ def convert_loyer_to_float(raw_value):
 # --- 5. FONCTION D'ANALYSE IA ---
 
 @st.cache_data(ttl=600) # Cache 10 minutes pour l'analyse IA
-def get_ai_market_analysis(city_name, prix_m2_achat, loyer_m2, renta_brute, typ_pred, nb_transactions, delta_prix):
+def get_ai_market_analysis(city_name, prix_m2_achat, loyer_m2_data, typ_pred, lwr_ip, upr_ip, r2_adj, nb_transactions, delta_prix):
     """
     Génère une analyse de marché basée sur les indicateurs clés via l'API Gemini.
     """
@@ -235,18 +238,33 @@ def get_ai_market_analysis(city_name, prix_m2_achat, loyer_m2, renta_brute, typ_
         "Vous êtes un analyste financier immobilier spécialisé dans l'investissement locatif en France. "
         "Fournissez une analyse concise (maximum 250 mots) et professionnelle du marché pour un investisseur. "
         "L'analyse doit être structurée en deux sections claires : **Points Forts** et **Points Faibles**. "
-        "Basez-vous *uniquement* sur les données fournies ci-dessous. Interprétez la fiabilité de l'estimation de loyer (TYPPRED)."
+        "Basez-vous *uniquement* sur les données fournies ci-dessous. Interprétez la fiabilité de l'estimation de loyer (TYPPRED et R2)."
+        "Mentionnez la meilleure typologie de bien pour un investissement locatif."
     )
     
+    # Construction de la chaîne de loyers détaillés
+    loyer_details = "\n".join([f"- {typ}: {loyer} €/m²" for typ, loyer in loyer_m2_data.items() if loyer > 0])
+    
+    # Interprétation de la fiabilité
+    if r2_adj < 0.5:
+        r2_interpretation = f"Faible (R2={r2_adj:.2f} < 0.5), suggérant une grande variabilité."
+    else:
+        r2_interpretation = f"Modérée/Bonne (R2={r2_adj:.2f} > 0.5)."
+
     # 2. Construction de la requête utilisateur avec les données
     user_query = f"""
     Analysez le marché pour la ville de {city_name} en vous basant sur ces métriques :
-    - Prix Achat Médian: {prix_m2_achat} €/m²
-    - Loyer Estimé: {loyer_m2} €/m²
-    - Rentabilité Brute (estimée): {renta_brute:.2f} %
-    - Fiabilité de l'estimation de loyer (TYPPRED): {typ_pred} (Rappel: 'commune' > 'epci' > 'maille')
-    - Volume de Transactions (analysées): {nb_transactions}
+    - Prix Achat Médian (tous types) : {prix_m2_achat} €/m²
     - Tendance prix vs historique: {delta_prix} €/m²
+    - Volume de Transactions (analysées): {nb_transactions}
+    
+    --- Indicateurs de Loyer ---
+    {loyer_details}
+    
+    --- Fiabilité de l'Estimation de Loyer ---
+    - Niveau de Prédiction (TYPPRED): {typ_pred} (Rappel: 'commune' > 'epci' > 'maille')
+    - Intervalle de Prédiction (95%): entre {lwr_ip:.2f} €/m² et {upr_ip:.2f} €/m²
+    - Coefficient de Détermination Ajusté (R2): {r2_interpretation}
     """
     
     payload = {
@@ -258,7 +276,7 @@ def get_ai_market_analysis(city_name, prix_m2_achat, loyer_m2, renta_brute, typ_
     
     for attempt in range(MAX_RETRIES):
         try:
-            # 3. Appel API avec gestion de l'authentification (si API_KEY est fourni par l'environnement)
+            # 3. Appel API avec gestion de l'authentification
             response = requests.post(BASE_URL, headers=headers, data=json.dumps(payload), timeout=30)
             response.raise_for_status()  # Lève une exception pour les codes d'erreur HTTP
             
@@ -328,27 +346,11 @@ if join_key_value:
         info_ville = get_city_data_full(join_key_value)
         df_transac = get_transactions(join_key_value)
 
-    # --- CALCUL DES KPIS (NÉCESSAIRE POUR L'IA) ---
+    # --- CALCUL DES KPIS & DONNÉES DE LOYER DÉTAILLÉES ---
+    
+    # Données d'achat (Transactions)
     prix_m2_achat = df_transac['prix_m2'].median() if not df_transac.empty else 0.0
     prix_m2_achat = float(prix_m2_achat) if pd.notna(prix_m2_achat) else 0.0
-    
-    loyer_keys = ['loypredm2', 'loyer_m2_appart_moyen_all'] 
-    raw_loyer_m2 = None
-    
-    typ_pred = "N/A"
-    
-    if info_ville:
-        typ_pred = info_ville.get('TYPPRED', 'N/A')
-        for key in loyer_keys:
-            raw_loyer_m2 = info_ville.get(key)
-            if raw_loyer_m2 is not None:
-                break 
-
-    loyer_m2 = convert_loyer_to_float(raw_loyer_m2)
-    
-    renta_brute = 0.0
-    if prix_m2_achat > 0 and loyer_m2 > 0:
-        renta_brute = ((loyer_m2 * 12) / prix_m2_achat) * 100
     
     derniere_annee = df_transac['date_mutation'].dt.year.max() if not df_transac.empty else "N/A"
     
@@ -361,8 +363,27 @@ if join_key_value:
     
     nb_transactions = len(df_transac)
     
+    # Données de Loyer (Dim_ville)
+    loyer_m2_all = convert_loyer_to_float(info_ville.get('loypredm2')) if info_ville else 0.0
+    
+    loyer_m2_data = {
+        "Appartement (Toutes types)": loyer_m2_all,
+        "Appartement T1-T2": convert_loyer_to_float(info_ville.get('loypredm2_t1t2')) if info_ville else 0.0,
+        "Appartement T3+": convert_loyer_to_float(info_ville.get('loypredm2_t3plus')) if info_ville else 0.0,
+        "Maison": convert_loyer_to_float(info_ville.get('loypredm2_maison')) if info_ville else 0.0,
+    }
+    
+    typ_pred = info_ville.get('TYPPRED', 'N/A') if info_ville else 'N/A'
+    lwr_ip = convert_loyer_to_float(info_ville.get('lwr.IPm2')) if info_ville else 0.0
+    upr_ip = convert_loyer_to_float(info_ville.get('upr.IPm2')) if info_ville else 0.0
+    r2_adj = convert_loyer_to_float(info_ville.get('R2_adj')) if info_ville else 0.0
+
+    renta_brute = 0.0
+    if prix_m2_achat > 0 and loyer_m2_all > 0:
+        renta_brute = ((loyer_m2_all * 12) / prix_m2_achat) * 100
+    
     # --- SECTION A : KPI MARKET (Réutilisation du code précédent) ---
-    if info_ville or not df_transac.empty: # Afficher même si seul df_transac est présent pour les KPI
+    if info_ville or not df_transac.empty: 
         
         st.subheader("Indicateurs Clés de Marché")
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
@@ -374,13 +395,13 @@ if join_key_value:
         )
         
         kpi2.metric(
-            "Loyer Estimé (Appt)", 
-            f"{loyer_m2:.1f} €/m²" if loyer_m2 > 0 else "N/A",
+            "Loyer Moyen Estimé (Appt)", 
+            f"{loyer_m2_all:.1f} €/m²" if loyer_m2_all > 0 else "N/A",
             help=f"Basé sur une prédiction de type : {typ_pred}"
         )
         
         kpi3.metric(
-            "Rentabilité Brute", 
+            "Rentabilité Brute (Base Appt)", 
             f"{renta_brute:.2f} %" if renta_brute > 0 else "N/A",
             delta="Opportunité" if renta_brute > 6 else "Marché tendu"
         )
@@ -391,18 +412,78 @@ if join_key_value:
             help="Nombre total de transactions analysées (limite max: 50 000)"
         )
         
-        # --- SECTION B : ANALYSE IA (NOUVEAU) ---
         st.divider()
+
+        # --- SECTION B : ANALYSE DES LOYERS ET FIABILITÉ (NOUVEAU) ---
+        st.subheader("📊 Loyer Détaillé et Fiabilité de l'Estimation")
+        
+        col_loyer, col_fiab = st.columns([3, 2])
+        
+        # B1. Graphique des loyers par typologie
+        with col_loyer:
+            # Création du DataFrame pour le graphique
+            df_loyer = pd.DataFrame(
+                list(loyer_m2_data.items()), 
+                columns=['Typologie', 'Loyer_m2']
+            ).sort_values('Loyer_m2', ascending=False)
+            df_loyer = df_loyer[df_loyer['Loyer_m2'] > 0] # Filtrer les valeurs absentes
+
+            if not df_loyer.empty:
+                fig_bar = px.bar(
+                    df_loyer, x='Typologie', y='Loyer_m2',
+                    title="Loyer Estimé (€/m²) par Type de Bien",
+                    labels={'Loyer_m2': 'Loyer €/m²'},
+                    color='Typologie',
+                    color_discrete_sequence=px.colors.qualitative.T10
+                )
+                fig_bar.update_layout(xaxis_title=None, showlegend=False)
+                st.plotly_chart(fig_bar, use_container_width=True)
+            else:
+                st.warning("⚠️ Données de loyer détaillées (Maison, T1/T2, T3+) non disponibles dans la source.")
+
+        # B2. Indicateurs de Fiabilité
+        with col_fiab:
+            st.markdown("##### Indicateurs de Fiabilité de l'Estimation (ANIL)")
+            
+            # Affichage du R2
+            st.metric(
+                "R2 Ajusté (Qualité du Modèle)", 
+                f"{r2_adj:.2f}",
+                help="Coefficient de détermination : plus il est proche de 1, meilleure est la prédiction."
+            )
+            
+            # Affichage TYPPRED
+            reliability_icon = "🟢" if typ_pred == "commune" else ("🟡" if typ_pred == "epci" else "🔴")
+            st.metric(
+                "Niveau de Prédiction (TYPPRED)",
+                f"{typ_pred.title()} {reliability_icon}",
+                help="Commune (le plus fiable) > EPCI > Maille (le moins fiable)."
+            )
+            
+            # Affichage de l'intervalle
+            if lwr_ip > 0 and upr_ip > 0:
+                interval_width = upr_ip - lwr_ip
+                st.metric(
+                    "Intervalle de Confiance (95%)",
+                    f"[{lwr_ip:.2f} €/m² à {upr_ip:.2f} €/m²]",
+                    help=f"Amplitude de {interval_width:.2f} €/m². Plus l'intervalle est petit, plus la prédiction est précise."
+                )
+
+        st.divider()
+
+        # --- SECTION C : ANALYSE IA ---
         st.subheader("🤖 Analyse du Marché pour l'Investisseur (Générée par IA)")
         
-        if prix_m2_achat > 0 and loyer_m2 > 0:
+        if prix_m2_achat > 0 and loyer_m2_all > 0:
             with st.spinner("Génération de l'analyse des Points Forts/Faibles..."):
                 analysis_text = get_ai_market_analysis(
                     row_ville['nom_commune'], 
                     prix_m2_achat, 
-                    loyer_m2, 
-                    renta_brute, 
+                    loyer_m2_data, 
                     typ_pred, 
+                    lwr_ip, 
+                    upr_ip, 
+                    r2_adj,
                     nb_transactions, 
                     delta_prix
                 )
@@ -412,37 +493,37 @@ if join_key_value:
 
         st.divider()
 
-        # --- SECTION C : GRAPHIQUES (Affiches seulement si transactions > 0) ---
+        # --- SECTION D : GRAPHIQUES HISTORIQUES ---
         if not df_transac.empty:
             
             g1, g2 = st.columns([2, 1])
             
             with g1:
-                st.subheader("📈 Évolution des prix")
+                st.subheader("📈 Évolution des prix d'achat")
                 # Agrégation par Trimestre
                 df_transac['trimestre'] = df_transac['date_mutation'].dt.to_period('Q').astype(str)
                 df_trend = df_transac.groupby('trimestre')['prix_m2'].median().reset_index()
                 
                 fig_line = px.line(
                     df_trend, x='trimestre', y='prix_m2', markers=True,
-                    title="Prix médian au m² par trimestre",
+                    title="Prix médian au m² par trimestre (Transactions DVF)",
                     labels={'prix_m2': 'Prix €/m²', 'trimestre': 'Période'}
                 )
                 fig_line.update_layout(xaxis_title=None)
                 st.plotly_chart(fig_line, use_container_width=True)
                 
             with g2:
-                st.subheader("📊 Distribution")
+                st.subheader("📊 Distribution des prix")
                 fig_hist = px.histogram(
                     df_transac, x="prix_m2", nbins=25,
-                    title="Répartition des prix au m²",
+                    title="Répartition des prix d'achat au m²",
                     color_discrete_sequence=['#636EFA']
                 )
                 if prix_m2_achat > 0:
                     fig_hist.add_vline(x=prix_m2_achat, line_dash="dash", line_color="red", annotation_text="Médiane")
                 st.plotly_chart(fig_hist, use_container_width=True)
 
-            # --- SECTION D : DATA EXPLORER ---
+            # --- SECTION E : DATA EXPLORER ---
             with st.expander("📂 Voir les dernières transactions détaillées"):
                 st.dataframe(
                     df_transac[['date_mutation', 'valeur_fonciere', 'surface_reelle_bati', 'prix_m2', 'type_local']]
