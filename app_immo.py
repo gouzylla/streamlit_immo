@@ -122,6 +122,7 @@ def get_city_data_full(join_key_value):
     TABLE_DIM_VILLE = 'Dim_ville'
     
     # Colonnes de loyer réelles dans la base de données de l'utilisateur
+    # Note: Si vous ajoutez d'autres colonnes INSEE, ajoutez-les ici aussi.
     select_columns = (
         'code_insee, code_postal, nom_commune, '
         'loyer_m2_maison_moyen, loyer_m2_appart_t1_t2, loyer_m2_appart_t3_plus'
@@ -288,7 +289,6 @@ if join_key_value:
     loyer_m2_maison = convert_loyer_to_float(info_ville.get('loyer_m2_maison_moyen')) if info_ville else 0.0
 
     # Estimation du loyer moyen Appartement global
-    # S'il y a des données pour T1/T2 ou T3+, on prend la moyenne, sinon 0.0
     loyers_appart = [l for l in [loyer_m2_t1t2, loyer_m2_t3plus] if l > 0]
     loyer_m2_all = sum(loyers_appart) / len(loyers_appart) if loyers_appart else 0.0
     
@@ -336,10 +336,10 @@ if join_key_value:
         
         st.divider()
 
-        # --- SECTION B : ANALYSE DES LOYERS DÉTAILLÉS ---
-        st.subheader("📊 Comparaison des Loyers Estimés par Typologie")
+        # --- SECTION B : ANALYSE DES LOYERS DÉTAILLÉS (TABLEAU SEUL) ---
+        st.subheader("📊 Loyers Estimés par Typologie")
         
-        # B1. Graphique des loyers par typologie (on filtre le loyer global estimé)
+        # Préparation des données pour le tableau
         df_loyer = pd.DataFrame(
             [
                 ("Appartement T1-T2", loyer_m2_data.get("Appartement T1-T2", 0.0)),
@@ -352,23 +352,13 @@ if join_key_value:
         df_loyer_filtered = df_loyer[df_loyer['Loyer_m2'] > 0] # Filtrer les valeurs absentes (si 0.0)
 
         if not df_loyer_filtered.empty:
-            fig_bar = px.bar(
-                df_loyer_filtered, x='Typologie', y='Loyer_m2',
-                title="Loyer Estimé (€/m²) par Type de Bien",
-                labels={'Loyer_m2': 'Loyer €/m²'},
-                color='Typologie',
-                color_discrete_sequence=px.colors.qualitative.T10
-            )
-            fig_bar.update_layout(xaxis_title=None, showlegend=False)
-            st.plotly_chart(fig_bar, use_container_width=True)
             
-            # Affichage en tableau des données pour la clarté
-            st.markdown("##### Détail des Loyers (€/m²)")
+            # Affichage du tableau des données
             st.dataframe(
                 df_loyer_filtered,
                 column_config={
                     "Typologie": "Type de Bien",
-                    "Loyer_m2": st.column_config.NumberColumn("Loyer Estimé", format="%.2f €")
+                    "Loyer_m2": st.column_config.NumberColumn("Loyer Estimé (€/m²)", format="%.2f €")
                 },
                 hide_index=True,
                 use_container_width=True
