@@ -144,7 +144,7 @@ def get_city_data_full(join_key_value):
     extended_columns = [
         'pop_totale', 'part_pop_15_29_ans_pct', 
         'revenu_dispo_median_uc', 'salaire_net_mensuel_moyen', 
-        'taux_chomage_calcule_pct' # FIX: Nom de colonne corrigé ici
+        'taux_chomage_calcule_pct' 
     ]
     # Colonnes de loyer
     loyer_columns = [
@@ -182,34 +182,54 @@ def get_city_data_full(join_key_value):
 
 def get_transactions(join_key_value):
     """
-    Récupère l'historique des ventes pour une ville donnée depuis Fct_transaction_immo.
+    Récupère TOUTES (via pagination) ou jusqu'à 100k transactions pour une ville donnée.
     """
     if not supabase: return pd.DataFrame()
     
     TABLE_FACT_TRANSAC = 'Fct_transaction_immo'
-    
     join_key_value_str = str(join_key_value).zfill(5)
     
-    try:
-        # Note: on récupère code_postal (bigint), on le compare à join_key_value_str (text)
-        # La comparaison .eq() gère généralement les types, mais pour être sûr, on pourrait 
-        # forcer l'argument en bigint si nécessaire. Ici, on laisse Supabase gérer la conversion.
-        response = supabase.table(TABLE_FACT_TRANSAC)\
-            .select('date_mutation, valeur_fonciere, surface_reelle_bati, type_local')\
-            .eq(st.session_state.join_id, join_key_value_str)\
-            .gt('valeur_fonciere', 5000)\
-            .gt('surface_reelle_bati', 9)\
-            .limit(50000)\
-            .execute()
-            
-    except APIError as e:
-        st.error(
-            f"❌ Erreur Supabase lors du chargement des transactions."
-            f"\nDétail technique: {e.message}"
-        )
-        return pd.DataFrame()
+    # Configuration de la pagination
+    PAGE_SIZE = 10000 
+    MAX_ROWS = 100000  # Limite de sécurité pour éviter le plantage de Streamlit sur des très grandes villes
+    all_data = []
+    offset = 0
     
-    df = pd.DataFrame(response.data)
+    # Ajout d'un bandeau informatif pendant le chargement des gros volumes de données
+    with st.spinner(f"Chargement des transactions... (Max {MAX_ROWS:,} lignes)"):
+        while offset < MAX_ROWS:
+            try:
+                response = supabase.table(TABLE_FACT_TRANSAC)\
+                    .select('date_mutation, valeur_fonciere, surface_reelle_bati, type_local')\
+                    .eq(st.session_state.join_id, join_key_value_str)\
+                    .gt('valeur_fonciere', 5000)\
+                    .gt('surface_reelle_bati', 9)\
+                    .order('date_mutation', desc=True)\
+                    .range(offset, offset + PAGE_SIZE - 1)\
+                    .execute()
+                
+                current_page_data = response.data
+                
+                if not current_page_data: break # Aucune donnée ou fin des données
+                
+                all_data.extend(current_page_data)
+                
+                if len(current_page_data) < PAGE_SIZE: break # Dernière page atteinte
+                
+                offset += PAGE_SIZE
+                
+            except APIError as e:
+                st.error(
+                    f"❌ Erreur Supabase lors du chargement des transactions."
+                    f"\nDétail technique: {e.message}"
+                )
+                break
+            except Exception as e:
+                print(f"Erreur get_transactions: {e}", file=sys.stderr)
+                st.error(f"❌ Erreur inattendue lors du chargement des transactions : {e}")
+                break
+            
+    df = pd.DataFrame(all_data)
     
     if not df.empty:
         # Typage et nettoyage des données
@@ -287,9 +307,8 @@ st.title(f"Analyse Immobilière : {row_ville['nom_commune']}")
 if join_key_value:
     
     # Chargement des données détaillées en utilisant le Code Postal
-    with st.spinner("Chargement des données de marché et transactions..."):
-        info_ville = get_city_data_full(join_key_value)
-        df_transac = get_transactions(join_key_value)
+    info_ville = get_city_data_full(join_key_value)
+    df_transac = get_transactions(join_key_value) # Cette fonction gère désormais la pagination
 
     # --- CALCUL DES KPIS & DONNÉES DE LOYER DÉTAILLÉES ---
     
@@ -347,7 +366,7 @@ if join_key_value:
         kpi4.metric(
             "Volume de Ventes", 
             f"{nb_transactions:,}" if nb_transactions > 0 else "N/A",
-            help="Nombre total de transactions analysées (limite max: 50 000)"
+            help=f"Nombre total de transactions analysées (max {MAX_ROWS:,})"
         )
         
         st.divider()
@@ -361,7 +380,7 @@ if join_key_value:
             part_jeunes = convert_to_float(info_ville.get('part_pop_15_29_ans_pct')) if info_ville else 0.0
             revenu_median = convert_to_int(info_ville.get('revenu_dispo_median_uc')) if info_ville else 0
             salaire_moyen = convert_to_int(info_ville.get('salaire_net_mensuel_moyen')) if info_ville else 0
-            # FIX: Utilisation du nom de colonne corrigé
+            # Utilisation du nom de colonne corrigé
             taux_chomage = convert_to_float(info_ville.get('taux_chomage_calcule_pct')) if info_ville else 0.0
             
         except Exception as e:
@@ -440,7 +459,7 @@ if join_key_value:
                 st.plotly_chart(fig_hist, use_container_width=True)
 
             # --- SECTION E : DATA EXPLORER ---
-            with st.expander("📂 Voir les dernières transactions détaillées"):
+            with st.expander(f"📂 Voir les {nb_transactions:,} dernières transactions détaillées"):
                 st.dataframe(
                     df_transac[['date_mutation', 'valeur_fonciere', 'surface_reelle_bati', 'prix_m2', 'type_local']]
                     .sort_values('date_mutation', ascending=False),
