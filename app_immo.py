@@ -115,17 +115,20 @@ def get_villes_list():
 
 def get_city_data_full(join_key_value):
     """
-    Récupère les infos détaillées de loyer pour une ville donnée depuis Dim_ville.
+    Récupère les infos détaillées de loyer et INSEE pour une ville donnée depuis Dim_ville.
     Utilise le Code Postal comme clé de recherche.
     """
     if not supabase: return None
     TABLE_DIM_VILLE = 'Dim_ville'
     
-    # Colonnes de loyer réelles dans la base de données de l'utilisateur
-    # Note: Si vous ajoutez d'autres colonnes INSEE, ajoutez-les ici aussi.
+    # Colonnes à récupérer, incluant les nouvelles données INSEE
+    # Assurez-vous que ces noms correspondent exactement à ceux de votre table Dim_ville dans Supabase
     select_columns = (
         'code_insee, code_postal, nom_commune, '
-        'loyer_m2_maison_moyen, loyer_m2_appart_t1_t2, loyer_m2_appart_t3_plus'
+        'loyer_m2_maison_moyen, loyer_m2_appart_t1_t2, loyer_m2_appart_t3_plus, loyer_m2_appart_moyen_all, '  # Loyers
+        'pop_totale, part_pop_15_29_ans_pct, ' # Démographie
+        'revenu_dispo_median_uc, salaire_net_mensuel_moyen, taux_chomage_pct, ' # Économie
+        'part_proprietaires_pct, part_logements_sociaux_pct, part_cadres_pct, part_residences_secondaires_pct' # Habitat/Social
     )
     
     # Assurer que l'identifiant de recherche (Code Postal) est bien une chaîne de caractères
@@ -142,10 +145,10 @@ def get_city_data_full(join_key_value):
             return response.data[0] 
         
     except APIError as e:
-        # Ajout d'une erreur si la structure de table est encore incorrecte (colonnes manquantes)
-        if 'column "loyer_m2' in str(e):
-             st.error("❌ ERREUR STRUCTURE DE TABLE : Une ou plusieurs colonnes de loyer sont introuvables. Vérifiez l'orthographe exacte.")
         print(f"Erreur get_city_data_full: {e}", file=sys.stderr)
+        # Message d'aide en cas d'erreur de colonne
+        if 'column' in str(e):
+             st.error("❌ ERREUR DE COLONNE : Une des colonnes demandées n'existe pas dans `Dim_ville`. Vérifiez les noms exacts dans Supabase.")
         
     return None
 
@@ -200,27 +203,27 @@ def get_transactions(join_key_value):
         
     return df
 
-# --- 4. UTILS POUR LA CONVERSION DE LOYER ---
+# --- 4. UTILS POUR LA CONVERSION DE DONNÉES ---
 
-def convert_loyer_to_float(raw_value):
-    """
-    Convertit une valeur de loyer potentiellement au format texte (avec virgule) en float.
-    Retourne 0.0 si la valeur est None ou non numérique.
-    """
+def convert_to_float(raw_value):
+    """Convertit une valeur potentiellement texte/None en float."""
     if raw_value is None:
         return 0.0
-    
     try:
-        # 1. Conversion en chaîne pour assurer la méthode .replace()
-        value_str = str(raw_value)
-        # 2. Remplacement de la virgule par le point (pour gérer le format français)
-        cleaned_value = value_str.replace(',', '.')
-        # 3. Conversion en float
-        return float(cleaned_value)
-    except ValueError as e:
-        # En cas d'échec (ex: chaîne vide, texte), on renvoie 0.0
-        print(f"ATTENTION: Échec de la conversion de la valeur de loyer '{raw_value}'. Détail: {e}", file=sys.stderr)
+        value_str = str(raw_value).replace(',', '.')
+        return float(value_str)
+    except ValueError:
         return 0.0
+
+def convert_to_int(raw_value):
+    """Convertit une valeur potentiellement texte/None en int."""
+    if raw_value is None:
+        return 0
+    try:
+        # On passe par float d'abord pour gérer les cas comme "1234.0"
+        return int(float(str(raw_value).replace(',', '.')))
+    except ValueError:
+        return 0
         
 # --- 5. INTERFACE UTILISATEUR (SIDEBAR) ---
 
@@ -251,7 +254,7 @@ with st.sidebar:
     st.divider()
     st.caption(f"Clé de Jointure utilisée (Code Postal) : {join_key_value}")
     st.caption(f"Code INSEE de référence : {row_ville['code_insee']}")
-    st.caption("Données sources : DVF (Etalab) & ANIL (Carte des Loyers)")
+    st.caption("Données sources : DVF (Etalab), ANIL & INSEE")
 
 # --- 6. DASHBOARD PRINCIPAL ---
 
@@ -274,7 +277,6 @@ if join_key_value:
     
     delta_prix = 0
     if pd.notna(derniere_annee) and derniere_annee != "N/A" and not df_transac.empty:
-        # On calcule le delta par rapport à la médiane historique de toutes les transactions chargées
         prix_m2_historique = df_transac['prix_m2'].median()
         prix_m2_recent = df_transac[df_transac['date_mutation'].dt.year == derniere_annee]['prix_m2'].median()
         prix_m2_recent = float(prix_m2_recent) if pd.notna(prix_m2_recent) else prix_m2_achat
@@ -282,20 +284,13 @@ if join_key_value:
     
     nb_transactions = len(df_transac)
     
-    # Données de Loyer (Dim_ville) - UTILISATION DES NOUVEAUX NOMS DE COLONNES
-    
-    loyer_m2_t1t2 = convert_loyer_to_float(info_ville.get('loyer_m2_appart_t1_t2')) if info_ville else 0.0
-    loyer_m2_t3plus = convert_loyer_to_float(info_ville.get('loyer_m2_appart_t3_plus')) if info_ville else 0.0
-    loyer_m2_maison = convert_loyer_to_float(info_ville.get('loyer_m2_maison_moyen')) if info_ville else 0.0
-
-    # Estimation du loyer moyen Appartement global
-    loyers_appart = [l for l in [loyer_m2_t1t2, loyer_m2_t3plus] if l > 0]
-    loyer_m2_all = sum(loyers_appart) / len(loyers_appart) if loyers_appart else 0.0
+    # Données de Loyer (Dim_ville)
+    loyer_m2_all = convert_to_float(info_ville.get('loyer_m2_appart_moyen_all')) if info_ville else 0.0
     
     loyer_m2_data = {
-        "Appartement T1-T2": loyer_m2_t1t2,
-        "Appartement T3 et +": loyer_m2_t3plus,
-        "Maison": loyer_m2_maison,
+        "Appartement T1-T2": convert_to_float(info_ville.get('loyer_m2_appart_t1_t2')) if info_ville else 0.0,
+        "Appartement T3 et +": convert_to_float(info_ville.get('loyer_m2_appart_t3_plus')) if info_ville else 0.0,
+        "Maison": convert_to_float(info_ville.get('loyer_m2_maison_moyen')) if info_ville else 0.0,
         "Appartement (Global Estimé)": loyer_m2_all, 
     }
     
@@ -316,7 +311,6 @@ if join_key_value:
             delta=f"{delta_prix} € vs historique"
         )
         
-        # Le KPI du loyer utilise le loyer 'Global Estimé' comme référence
         kpi2.metric(
             "Loyer Moyen Estimé (Appt)", 
             f"{loyer_m2_all:.1f} €/m²" if loyer_m2_all > 0 else "N/A",
@@ -333,6 +327,48 @@ if join_key_value:
             f"{nb_transactions}",
             help="Nombre total de transactions analysées (limite max: 50 000)"
         )
+        
+        st.divider()
+
+        # --- NOUVELLE SECTION INSEE COMPLÈTE ---
+        st.subheader("🌍 Profil Socio-démographique et Économique (Source INSEE)")
+        
+        # Récupération et conversion des données INSEE
+        try:
+            # Démographie
+            pop_totale = convert_to_int(info_ville.get('pop_totale')) if info_ville else 0
+            part_jeunes = convert_to_float(info_ville.get('part_pop_15_29_ans_pct')) if info_ville else 0.0
+            
+            # Économie
+            revenu_median = convert_to_int(info_ville.get('revenu_dispo_median_uc')) if info_ville else 0
+            salaire_moyen = convert_to_int(info_ville.get('salaire_net_mensuel_moyen')) if info_ville else 0
+            taux_chomage = convert_to_float(info_ville.get('taux_chomage_pct')) if info_ville else 0.0
+            part_cadres = convert_to_float(info_ville.get('part_cadres_pct')) if info_ville else 0.0
+            
+            # Logement
+            part_proprietaires = convert_to_float(info_ville.get('part_proprietaires_pct')) if info_ville else 0.0
+            part_locataires = 100 - part_proprietaires if part_proprietaires > 0 else 0.0
+            part_log_sociaux = convert_to_float(info_ville.get('part_logements_sociaux_pct')) if info_ville else 0.0
+            part_res_secondaires = convert_to_float(info_ville.get('part_residences_secondaires_pct')) if info_ville else 0.0
+            
+        except Exception as e:
+            st.error(f"Erreur lors du traitement des données INSEE : {e}")
+            pop_totale = revenu_median = salaire_moyen = 0
+            part_jeunes = taux_chomage = part_cadres = part_proprietaires = part_locataires = part_log_sociaux = part_res_secondaires = 0.0
+
+        # Ligne 1 : Démographie et Revenus
+        col_demo1, col_demo2, col_demo3, col_demo4 = st.columns(4)
+        col_demo1.metric("Population totale", f"{pop_totale:,.0f} hab." if pop_totale > 0 else 'N/A')
+        col_demo2.metric("Part 15-29 ans (Jeunes)", f"{part_jeunes:.1f} %" if part_jeunes > 0 else 'N/A')
+        col_demo3.metric("Salaire net mensuel", f"{salaire_moyen} €" if salaire_moyen > 0 else 'N/A')
+        col_demo4.metric("Revenu Disponible Médian", f"{revenu_median} €" if revenu_median > 0 else 'N/A')
+        
+        # Ligne 2 : Emploi et Logement
+        col_eco1, col_eco2, col_eco3, col_eco4 = st.columns(4)
+        col_eco1.metric("Taux de Chômage", f"{taux_chomage:.1f} %" if taux_chomage > 0 else 'N/A')
+        col_eco2.metric("Part des Cadres", f"{part_cadres:.1f} %" if part_cadres > 0 else 'N/A')
+        col_eco3.metric("Part des Locataires", f"{part_locataires:.1f} %" if part_locataires > 0 else 'N/A')
+        col_eco4.metric("Logements Sociaux", f"{part_log_sociaux:.1f} %" if part_log_sociaux > 0 else 'N/A')
         
         st.divider()
 
@@ -366,12 +402,12 @@ if join_key_value:
             
         else:
             # Message d'alerte si les loyers sont N/A
-            st.warning("⚠️ Les données de loyer (Loyers Moyens et détaillés) sont absentes dans la table `Dim_ville` pour cette ville. La ligne a été trouvée, mais les colonnes de loyer sont vides/nulles.")
+            st.warning("⚠️ Les données de loyer (Loyers Moyens et détaillés) sont absentes dans la table `Dim_ville` pour cette ville.")
             
-            # Aide au débogage : Affichage de la ligne de Dim_ville trouvée
+            # Aide au débogage
             if info_ville:
-                st.info(f"💡 DEBUG: La ligne de `Dim_ville` trouvée pour {join_key_value} contient ces données brutes :")
-                st.json(info_ville)
+                st.info(f"💡 DEBUG: Données reçues pour {join_key_value}.")
+                # st.json(info_ville) # Décommenter pour voir toutes les données brutes
 
         st.divider()
 
