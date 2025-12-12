@@ -322,6 +322,8 @@ if join_key_value:
     delta_prix_abs = 0
     delta_prix_pct = None # Pour stocker la variation relative
     nb_transactions = len(df_transac)
+    # Correction: Initialisation du compteur de transactions du dernier quadrimestre
+    nb_transac_lqm = 0 
     
     if not df_transac.empty:
         # Déterminer la date maximale des transactions
@@ -334,6 +336,7 @@ if join_key_value:
         if not df_lqm.empty:
             prix_m2_achat = df_lqm['prix_m2'].median()
             prix_m2_achat = float(prix_m2_achat) if pd.notna(prix_m2_achat) else 0.0
+            nb_transac_lqm = len(df_lqm) # Stocker le nombre de transactions du dernier quadrimestre
             
             # 2. Définir le Quadrimestre Précédent (PQM - 4 mois, 12 mois avant LQM)
             # Période de 4 mois se terminant 12 mois avant max_date
@@ -376,7 +379,8 @@ if join_key_value:
             "Prix Achat Médian (m²) - Dernier Quadrimestre", 
             f"{int(prix_m2_achat):,} €" if prix_m2_achat > 0 else "N/A",
             delta=delta_label,
-            help=f"Médiane des 4 derniers mois vs médiane des 4 mois, 12 mois auparavant. (Total transactions: {len(df_lqm):,})"
+            # Correction: Utilisation de la nouvelle variable nb_transac_lqm
+            help=f"Médiane des 4 derniers mois vs médiane des 4 mois, 12 mois auparavant. (Total transactions: {nb_transac_lqm:,})" 
         )
         
         kpi2.metric(
