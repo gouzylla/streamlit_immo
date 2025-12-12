@@ -144,9 +144,10 @@ def get_city_data_full(join_key_value):
     TABLE_DIM_VILLE = 'Dim_ville'
     
     # Liste des colonnes selon le schéma fourni
+    # Suppression de 'salaire_net_mensuel_moyen' car nous utilisons 'revenu_dispo_median_uc'
     extended_columns = [
         'pop_totale', 'part_pop_15_29_ans_pct', 
-        'revenu_dispo_median_uc', 'salaire_net_mensuel_moyen', 
+        'revenu_dispo_median_uc', 
         'taux_chomage_calcule_pct' 
     ]
     # Colonnes de loyer
@@ -316,29 +317,43 @@ if join_key_value:
 
     # --- CALCUL DES KPIS & DONNÉES DE LOYER DÉTAILLÉES ---
     
-    # Données d'achat (Transactions)
-    prix_m2_achat = df_transac['prix_m2'].median() if not df_transac.empty else 0.0
-    prix_m2_achat = float(prix_m2_achat) if pd.notna(prix_m2_achat) else 0.0
-    
-    derniere_annee = df_transac['date_mutation'].dt.year.max() if not df_transac.empty else "N/A"
-    
-    delta_prix = 0
-    if pd.notna(derniere_annee) and derniere_annee != "N/A" and not df_transac.empty:
-        # Calcul du delta par rapport à la moyenne historique
-        prix_m2_historique = df_transac['prix_m2'].mean()
-        delta_prix = int(prix_m2_achat - prix_m2_historique)
-    
+    # Données d'achat (Transactions) - MISE À JOUR DU CALCUL DU PRIX MÉDIAN ET DU DELTA
+    prix_m2_achat = 0.0
+    delta_prix_abs = 0
+    delta_prix_pct = None # Pour stocker la variation relative
     nb_transactions = len(df_transac)
     
+    if not df_transac.empty:
+        # Déterminer la date maximale des transactions
+        max_date = df_transac['date_mutation'].max()
+        
+        # 1. Définir le Dernier Quadrimestre (LQM - 4 mois avant max_date)
+        start_date_lqm = max_date - pd.DateOffset(months=4)
+        df_lqm = df_transac[df_transac['date_mutation'] > start_date_lqm].copy()
+        
+        if not df_lqm.empty:
+            prix_m2_achat = df_lqm['prix_m2'].median()
+            prix_m2_achat = float(prix_m2_achat) if pd.notna(prix_m2_achat) else 0.0
+            
+            # 2. Définir le Quadrimestre Précédent (PQM - 4 mois, 12 mois avant LQM)
+            # Période de 4 mois se terminant 12 mois avant max_date
+            end_date_pqm = max_date - pd.DateOffset(years=1)
+            start_date_pqm = end_date_pqm - pd.DateOffset(months=4)
+            df_pqm = df_transac[
+                (df_transac['date_mutation'] > start_date_pqm) & 
+                (df_transac['date_mutation'] <= end_date_pqm)
+            ].copy()
+            
+            if not df_pqm.empty:
+                prix_m2_pqm = df_pqm['prix_m2'].median()
+                prix_m2_pqm = float(prix_m2_pqm) if pd.notna(prix_m2_pqm) else 0.0
+                
+                if prix_m2_achat > 0 and prix_m2_pqm > 0:
+                    delta_prix_abs = int(prix_m2_achat - prix_m2_pqm)
+                    delta_prix_pct = ((prix_m2_achat - prix_m2_pqm) / prix_m2_pqm) * 100
+        
     # Données de Loyer (Dim_ville)
     loyer_m2_all = convert_to_float(info_ville.get('loyer_m2_appart_moyen_all')) if info_ville else 0.0
-    
-    loyer_m2_data = {
-        "Appartement T1-T2": convert_to_float(info_ville.get('loyer_m2_appart_t1_t2')) if info_ville else 0.0,
-        "Appartement T3 et +": convert_to_float(info_ville.get('loyer_m2_appart_t3_plus')) if info_ville else 0.0,
-        "Maison": convert_to_float(info_ville.get('loyer_m2_maison_moyen')) if info_ville else 0.0,
-        "Appartement (Global Estimé)": loyer_m2_all, 
-    }
     
     # Calcul de la rentabilité brute
     renta_brute = 0.0
@@ -351,10 +366,17 @@ if join_key_value:
         st.subheader("Indicateurs Clés de Marché")
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
         
+        # KPI 1: Prix Achat Médian - Mise à jour pour le dernier quadrimestre
+        delta_label = None
+        if delta_prix_pct is not None:
+             # Formattage du delta pour afficher absolu et relatif
+            delta_label = f"{delta_prix_abs:+} € ({delta_prix_pct:+.1f} %)"
+            
         kpi1.metric(
-            "Prix Achat Médian (m²)", 
+            "Prix Achat Médian (m²) - Dernier Quadrimestre", 
             f"{int(prix_m2_achat):,} €" if prix_m2_achat > 0 else "N/A",
-            delta=f"{delta_prix} € vs moyenne" if delta_prix != 0 else None
+            delta=delta_label,
+            help=f"Médiane des 4 derniers mois vs médiane des 4 mois, 12 mois auparavant. (Total transactions: {len(df_lqm):,})"
         )
         
         kpi2.metric(
@@ -371,7 +393,6 @@ if join_key_value:
         kpi4.metric(
             "Volume de Ventes", 
             f"{nb_transactions:,}" if nb_transactions > 0 else "N/A",
-            # CORRECTION : Utilisation de la constante MAX_ROWS
             help=f"Nombre total de transactions analysées (max {MAX_ROWS:,})"
         )
         
@@ -384,21 +405,30 @@ if join_key_value:
         try:
             pop_totale = convert_to_int(info_ville.get('pop_totale')) if info_ville else 0
             part_jeunes = convert_to_float(info_ville.get('part_pop_15_29_ans_pct')) if info_ville else 0.0
-            revenu_median = convert_to_int(info_ville.get('revenu_dispo_median_uc')) if info_ville else 0
-            salaire_moyen = convert_to_int(info_ville.get('salaire_net_mensuel_moyen')) if info_ville else 0
-            # Utilisation du nom de colonne corrigé
+            
+            # NOUVEAU: Utilisation du revenu disponible médian annuel
+            revenu_median_annuel = convert_to_float(info_ville.get('revenu_dispo_median_uc')) if info_ville else 0.0
+            
+            # NOUVEAU CALCUL: Revenu disponible médian annuel * 1.1 / 12 (estimation salaire net mensuel)
+            salaire_moyen_estime = int((revenu_median_annuel * 1.1) / 12) if revenu_median_annuel > 0 else 0
+            
             taux_chomage = convert_to_float(info_ville.get('taux_chomage_calcule_pct')) if info_ville else 0.0
             
         except Exception as e:
             st.error(f"Erreur lors du traitement des données INSEE : {e}")
-            pop_totale = revenu_median = salaire_moyen = 0
+            pop_totale = revenu_median_annuel = 0
             part_jeunes = taux_chomage = 0.0
 
         # Affichage des métriques INSEE
         col_demo1, col_demo2, col_demo3, col_demo4 = st.columns(4)
         col_demo1.metric("Population totale", f"{pop_totale:,.0f} hab." if pop_totale > 0 else 'N/A')
         col_demo2.metric("Part 15-29 ans", f"{part_jeunes:.1f} %" if part_jeunes > 0 else 'N/A', help="Indique le dynamisme potentiel (étudiants, jeunes actifs).")
-        col_demo3.metric("Salaire net mensuel (moyen)", f"{salaire_moyen:,} €" if salaire_moyen > 0 else 'N/A')
+        # Utilisation de la nouvelle valeur estimée
+        col_demo3.metric(
+            "Revenu Disponible (Mensuel Estimé)", 
+            f"{salaire_moyen_estime:,} €" if salaire_moyen_estime > 0 else 'N/A',
+            help="Basé sur le revenu disponible médian annuel, actualisé (+10%) et mensualisé."
+        )
         col_demo4.metric("Taux de Chômage", f"{taux_chomage:.1f} %" if taux_chomage > 0 else 'N/A')
         
         st.divider()
@@ -407,6 +437,13 @@ if join_key_value:
         st.subheader("🏡 Loyers Estimés par Typologie (Source ANIL)")
         
         # Préparation du DataFrame pour le tableau des loyers
+        loyer_m2_data = {
+            "Appartement T1-T2": convert_to_float(info_ville.get('loyer_m2_appart_t1_t2')) if info_ville else 0.0,
+            "Appartement T3 et +": convert_to_float(info_ville.get('loyer_m2_appart_t3_plus')) if info_ville else 0.0,
+            "Maison": convert_to_float(info_ville.get('loyer_m2_maison_moyen')) if info_ville else 0.0,
+            "Appartement (Global Estimé)": loyer_m2_all, 
+        }
+
         df_loyer = pd.DataFrame(
             [
                 ("Appartement T1-T2", loyer_m2_data.get("Appartement T1-T2", 0.0)),
@@ -461,7 +498,7 @@ if join_key_value:
                     color_discrete_sequence=['#636EFA']
                 )
                 if prix_m2_achat > 0:
-                    fig_hist.add_vline(x=prix_m2_achat, line_dash="dash", line_color="red", annotation_text="Médiane", annotation_position="top left")
+                    fig_hist.add_vline(x=prix_m2_achat, line_dash="dash", line_color="red", annotation_text="Médiane Dernier Q", annotation_position="top left")
                 st.plotly_chart(fig_hist, use_container_width=True)
 
             # --- SECTION E : DATA EXPLORER ---
